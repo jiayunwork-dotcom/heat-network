@@ -228,14 +228,14 @@ with tabs[0]:
         r: NetworkResults = st.session_state.results
         col1, col2, col3, col4 = st.columns(4)
         with col1:
-            st.metric("总供热量", f"{r.total_heat_supplied/1e6:.2f}", "MW", delta_color="off")
+            st.metric("总供热量", f"{r.total_heat_supplied/1e6:.2f} MW")
         with col2:
-            st.metric("管网总热损失", f"{r.total_heat_loss/1e6:.2f}", "MW",
+            st.metric("管网总热损失", f"{r.total_heat_loss/1e6:.2f} MW",
                       delta=f"{r.heat_loss_rate:.1f}%")
         with col3:
-            st.metric("泵站总耗电", f"{r.total_pump_power:.1f}", "kW", delta_color="off")
+            st.metric("泵站总耗电", f"{r.total_pump_power:.1f} kW")
         with col4:
-            st.metric("供热单耗", f"{r.specific_energy_consumption:.2f}", "kWh/GJ",
+            st.metric("供热单耗", f"{r.specific_energy_consumption:.2f} kWh/GJ",
                       delta="输送电耗/供热量", delta_color="off")
         st.divider()
         col5, col6, col7 = st.columns(3)
@@ -252,7 +252,7 @@ with tabs[0]:
             st.caption(f"其中泵站 {pump_c} 个，阀门 {valve_c} 个")
         with col7:
             total_len = sum(p.length for p in net.pipes.values())
-            st.metric("管网总长度", f"{total_len:.0f}", "m")
+            st.metric("管网总长度", f"{total_len:.0f} m")
             avg_age = sum(p.pipe_age for p in net.pipes.values()) / len(net.pipes)
             st.caption(f"平均管龄 {avg_age:.1f} 年")
         st.divider()
@@ -507,7 +507,7 @@ with tabs[5]:
                 st.metric("⚠ 需调节", n_bad, delta_color="inverse")
             with c_tot:
                 avg_dev = np.mean([abs(r - 1) for r in st.session_state.flow_ratios.values()]) * 100
-                st.metric("平均偏差", f"{avg_dev:.1f}", "%")
+                st.metric("平均偏差", f"{avg_dev:.1f}%")
             st.markdown("##### 📋 各末端用户流量不均匀度")
             st.dataframe(pd.DataFrame(fr_rows), use_container_width=True, hide_index=True, height=400)
         st.divider()
