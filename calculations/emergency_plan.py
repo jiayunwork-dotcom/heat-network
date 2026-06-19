@@ -29,6 +29,25 @@ class EmergencyAction:
     description: str
     detail: str = ""
     estimated_effect: str = ""
+    suggested_params: Dict = field(default_factory=dict)
+
+
+@dataclass
+class RecoveryEffect:
+    action_index: int
+    action_description: str
+    user_temp_changes: Dict[int, float] = field(default_factory=dict)
+    user_pressure_changes: Dict[int, float] = field(default_factory=dict)
+    original_temp_avg: float = 0.0
+    recovered_temp_avg: float = 0.0
+    original_pressure_avg: float = 0.0
+    recovered_pressure_avg: float = 0.0
+    temp_gap_reduction_pct: float = 0.0
+    pressure_gap_reduction_pct: float = 0.0
+    updated_results: Optional[NetworkResults] = None
+    updated_impact: Optional[ImpactAssessment] = None
+    updated_network: Optional[PipeNetwork] = None
+    updated_source_temps: Dict[int, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -96,6 +115,9 @@ def _generate_pipe_burst_actions(
     if not burst_pipe:
         return actions
 
+    adjacent_valves = _find_adjacent_valve_pipes(original_network, fault.target_id)
+    valve_ids = [v.id for v in adjacent_valves]
+
     action1 = EmergencyAction(
         priority=1,
         action_type="隔离故障",
@@ -103,8 +125,12 @@ def _generate_pipe_burst_actions(
         target_name=burst_pipe.name,
         description=f"立即关闭 {burst_pipe.name} 上下游阀门，隔离故障管段",
         detail=f"管段ID: {fault.target_id}，管径{burst_pipe.diameter*1000:.0f}mm，长度{burst_pipe.length:.0f}m",
+        suggested_params={
+            "action": "isolate_pipe",
+            "burst_pipe_id": fault.target_id,
+            "close_valve_ids": valve_ids,
+        },
     )
-    adjacent_valves = _find_adjacent_valve_pipes(original_network, fault.target_id)
     if adjacent_valves:
         valve_names = "、".join([f"{v.name}(ID:{v.id})" for v in adjacent_valves])
         action1.detail += f"。需关闭阀门: {valve_names}"
@@ -112,6 +138,7 @@ def _generate_pipe_burst_actions(
 
     alt_path = _find_alternate_path(modified_network, fault.target_id, original_network)
     if alt_path and len(alt_path) > 2:
+        path_pipe_ids = []
         path_names = []
         for i in range(len(alt_path) - 1):
             s, e = alt_path[i], alt_path[i + 1]
@@ -119,6 +146,7 @@ def _generate_pipe_burst_actions(
                 if (pipe.start_node_id == s and pipe.end_node_id == e) or \
                    (pipe.start_node_id == e and pipe.end_node_id == s):
                     path_names.append(pipe.name)
+                    path_pipe_ids.append(pid)
                     break
         if path_names:
             actions.append(EmergencyAction(
@@ -129,6 +157,11 @@ def _generate_pipe_burst_actions(
                 description=f"启用备用供水路径: {' → '.join(path_names)}",
                 detail=f"管网存在环路，可通过备用路径恢复下游用户供水",
                 estimated_effect="预计可恢复大部分受影响用户的供水",
+                suggested_params={
+                    "action": "switch_path",
+                    "burst_pipe_id": fault.target_id,
+                    "alternate_path_pipe_ids": path_pipe_ids,
+                },
             ))
 
     if impact.disconnected_user_ids:
@@ -140,6 +173,7 @@ def _generate_pipe_burst_actions(
             description=f"通知 {len(impact.disconnected_user_ids)} 户断供用户做好应急准备",
             detail=f"断供用户: {'、'.join(impact.disconnected_user_names[:5])}" +
                    ("等" if len(impact.disconnected_user_names) > 5 else ""),
+            suggested_params={"action": "notify_users", "user_ids": impact.disconnected_user_ids},
         ))
 
     return actions
@@ -176,6 +210,7 @@ def _generate_pump_failure_actions(
         target_name=failed_pump.name,
         description=f"确认 {failed_pump.name} 泵站已安全停运",
         detail=f"原工作参数: 流量{original_flow*1000:.1f}L/s, 扬程{original_head:.1f}m, 功率{original_power:.1f}kW",
+        suggested_params={"action": "stop_pump", "pump_pipe_id": fault.target_id},
     ))
 
     other_pumps = []
@@ -208,6 +243,11 @@ def _generate_pump_failure_actions(
                         description=f"提高 {opipe.name} 泵站出力，补偿扬程损失",
                         detail=f"当前扬程{current_head:.1f}m，可提升至约{max_head:.1f}m",
                         estimated_effect=f"预计可补偿约{(max_head-current_head)/max(total_extra_head_needed,1)*100:.0f}%的扬程缺口",
+                        suggested_params={
+                            "action": "increase_pump_head",
+                            "pump_pipe_id": opid,
+                            "target_head": max_head,
+                        },
                     ))
                     compensated = True
 
@@ -219,6 +259,7 @@ def _generate_pump_failure_actions(
                 target_name="系统警告",
                 description="剩余泵站能力不足，无法完全补偿故障泵站的扬程损失",
                 detail="建议降低部分非核心用户负荷，优先保障关键用户",
+                suggested_params={"action": "warning"},
             ))
 
     if impact.low_pressure_users:
@@ -229,6 +270,7 @@ def _generate_pump_failure_actions(
             target_name="低压用户",
             description=f"关注 {len(impact.low_pressure_users)} 户压力不达标用户",
             detail=f"低压用户压力低于 {MIN_OPERATING_PRESSURE} mH₂O，需重点监控",
+            suggested_params={"action": "monitor_pressure", "user_ids": impact.low_pressure_users},
         ))
 
     return actions, fault_results
@@ -258,6 +300,7 @@ def _generate_source_shutdown_actions(
         target_name=shutdown_source.name,
         description=f"确认 {shutdown_source.name} 已安全停机",
         detail=f"额定容量: {(shutdown_source.rated_capacity or 0)/1e6:.1f} MW",
+        suggested_params={"action": "stop_source", "source_id": fault.target_id},
     ))
 
     remaining_sources = []
@@ -273,6 +316,7 @@ def _generate_source_shutdown_actions(
             target_name="系统警告",
             description="无剩余可用热源，系统完全瘫痪！",
             detail="建议立即启动备用锅炉或跨区域调度应急热源",
+            suggested_params={"action": "critical_warning"},
         ))
         return actions, fault_results, new_source_temps
 
@@ -314,6 +358,11 @@ def _generate_source_shutdown_actions(
                     description=f"将 {src.name} 供水温度从 {orig_src_temp:.1f}°C 提升至 {new_temp:.1f}°C",
                     detail=f"提升幅度 {temp_increase:.1f}°C，预计可增加供热能力约 {per_source_extra/1e6:.2f} MW",
                     estimated_effect=f"预计可使末端用户温度提升约 {temp_increase*0.6:.1f}°C",
+                    suggested_params={
+                        "action": "increase_source_temp",
+                        "source_id": src.id,
+                        "new_temperature": new_temp,
+                    },
                 ))
     else:
         for src in remaining_sources:
@@ -331,6 +380,11 @@ def _generate_source_shutdown_actions(
                     target_name=src.name,
                     description=f"建议将 {src.name} 供水温度提升至 {new_temp:.1f}°C（当前 {orig_src_temp:.1f}°C）",
                     detail=f"预防性提温 {temp_increase:.1f}°C，应对停机带来的负荷转移",
+                    suggested_params={
+                        "action": "increase_source_temp",
+                        "source_id": src.id,
+                        "new_temperature": new_temp,
+                    },
                 ))
 
     actions.append(EmergencyAction(
@@ -341,6 +395,7 @@ def _generate_source_shutdown_actions(
         description=f"重新分配负荷至剩余 {len(remaining_sources)} 个热源",
         detail=f"已停机容量 {(shutdown_capacity or 0)/1e6:.1f} MW，剩余容量 {total_remaining_capacity/1e6:.1f} MW",
         estimated_effect=f"容量裕度约 {(total_remaining_capacity - shutdown_capacity)/max(total_remaining_capacity,1)*100:.0f}%",
+        suggested_params={"action": "redistribute_load"},
     ))
 
     low_temp_users = []
@@ -360,6 +415,7 @@ def _generate_source_shutdown_actions(
             description=f"{len(low_temp_users)} 户用户供水温度低于 {min_temp_threshold}°C 预警阈值",
             detail="用户列表: " + "、".join([f"{n}({t:.1f}°C)" for n, t in low_temp_users[:5]]) +
                    ("等" if len(low_temp_users) > 5 else ""),
+            suggested_params={"action": "temp_warning"},
         ))
 
     return actions, fault_results, new_source_temps
@@ -419,3 +475,196 @@ def generate_emergency_plan(
         )
 
     return plan, current_results, current_source_temps
+
+
+def execute_emergency_action(
+    original_network: PipeNetwork,
+    original_results: NetworkResults,
+    current_modified_network: PipeNetwork,
+    current_fault_results: Optional[NetworkResults],
+    current_impact: ImpactAssessment,
+    current_source_temps: Dict[int, float],
+    action: EmergencyAction,
+    faults: List[FaultConfig],
+    action_index: int,
+) -> Optional[RecoveryEffect]:
+    params = action.suggested_params or {}
+    action_name = params.get("action", "")
+
+    if action_name not in ["increase_source_temp", "increase_pump_head", "switch_path", "isolate_pipe"]:
+        return None
+
+    new_network = copy.deepcopy(current_modified_network)
+    new_source_temps = dict(current_source_temps)
+
+    if action_name == "increase_source_temp":
+        src_id = params.get("source_id")
+        new_temp = params.get("new_temperature")
+        if src_id is not None and new_temp is not None:
+            new_source_temps[src_id] = float(new_temp)
+    elif action_name == "increase_pump_head":
+        pump_pid = params.get("pump_pipe_id")
+        target_head = params.get("target_head")
+        if pump_pid is not None and pump_pid in new_network.pipes:
+            pipe = new_network.pipes[pump_pid]
+            if pipe.has_pump and target_head:
+                pipe.rated_head = float(target_head)
+                qmax = float(target_head) / 30.0
+                pipe.pump_efficiency_curve = [
+                    (0, float(target_head) * 1.2),
+                    (qmax * 0.5, float(target_head)),
+                    (qmax, float(target_head) * 0.3),
+                ]
+    elif action_name == "switch_path":
+        pass
+    elif action_name == "isolate_pipe":
+        pass
+
+    try:
+        valid, _ = new_network.validate()
+        if not valid:
+            return None
+
+        updated_results = solve_coupled(new_network, new_source_temps)
+
+        has_pump_failure = any(f.fault_type == FAULT_TYPE_PUMP_FAILURE for f in faults)
+        if has_pump_failure and updated_results is not None and original_results is not None:
+            from calculations.fault_simulation import _adjust_flow_and_temperature_for_pump_failure
+            updated_results = _adjust_flow_and_temperature_for_pump_failure(
+                original_network, new_network,
+                original_results, updated_results,
+                new_source_temps,
+            )
+
+        updated_impact = _assess_impact_for_recovery(
+            original_network, original_results,
+            new_network, updated_results,
+            faults,
+        )
+
+        effect = RecoveryEffect(
+            action_index=action_index,
+            action_description=action.description,
+            updated_results=updated_results,
+            updated_impact=updated_impact,
+            updated_network=new_network,
+            updated_source_temps=new_source_temps,
+        )
+
+        end_users = original_network.get_nodes_by_type(NODE_TYPE_END_USER)
+        orig_temps = []
+        orig_pressures = []
+        recov_temps = []
+        recov_pressures = []
+        normal_temps = []
+        normal_pressures = []
+
+        for user in end_users:
+            normal_nr = original_results.node_results.get(user.id)
+            before_nr = current_fault_results.node_results.get(user.id) if current_fault_results else None
+            after_nr = updated_results.node_results.get(user.id) if updated_results else None
+
+            if normal_nr:
+                normal_temps.append(normal_nr.temperature)
+                normal_pressures.append(normal_nr.pressure)
+            if before_nr and user.id not in current_impact.disconnected_user_ids:
+                orig_temps.append(before_nr.temperature)
+                orig_pressures.append(before_nr.pressure)
+            if after_nr and user.id not in updated_impact.disconnected_user_ids:
+                recov_temps.append(after_nr.temperature)
+                recov_pressures.append(after_nr.pressure)
+
+            if before_nr and after_nr:
+                if user.id not in current_impact.disconnected_user_ids:
+                    effect.user_temp_changes[user.id] = after_nr.temperature - before_nr.temperature
+                    effect.user_pressure_changes[user.id] = after_nr.pressure - before_nr.pressure
+
+        if orig_temps and recov_temps and normal_temps:
+            effect.original_temp_avg = sum(orig_temps) / len(orig_temps)
+            effect.recovered_temp_avg = sum(recov_temps) / len(recov_temps)
+            normal_temp_avg = sum(normal_temps) / len(normal_temps)
+            orig_gap = normal_temp_avg - effect.original_temp_avg
+            recov_gap = normal_temp_avg - effect.recovered_temp_avg
+            if orig_gap > 0.01:
+                effect.temp_gap_reduction_pct = (orig_gap - recov_gap) / orig_gap * 100.0
+
+        if orig_pressures and recov_pressures and normal_pressures:
+            effect.original_pressure_avg = sum(orig_pressures) / len(orig_pressures)
+            effect.recovered_pressure_avg = sum(recov_pressures) / len(recov_pressures)
+            normal_pressure_avg = sum(normal_pressures) / len(normal_pressures)
+            orig_gap_p = normal_pressure_avg - effect.original_pressure_avg
+            recov_gap_p = normal_pressure_avg - effect.recovered_pressure_avg
+            if orig_gap_p > 0.01:
+                effect.pressure_gap_reduction_pct = (orig_gap_p - recov_gap_p) / orig_gap_p * 100.0
+
+        return effect
+    except Exception:
+        return None
+
+
+def _assess_impact_for_recovery(
+    original_network: PipeNetwork,
+    original_results: NetworkResults,
+    modified_network: PipeNetwork,
+    fault_results: Optional[NetworkResults],
+    faults: List[FaultConfig],
+) -> ImpactAssessment:
+    from calculations.fault_simulation import ImpactAssessment, MIN_OPERATING_PRESSURE, _find_disconnected_nodes
+
+    impact = ImpactAssessment()
+    active_source_ids = [n.id for n in modified_network.get_nodes_by_type(NODE_TYPE_SOURCE)]
+    disconnected_ids = _find_disconnected_nodes(modified_network, active_source_ids)
+
+    original_users = original_network.get_nodes_by_type(NODE_TYPE_END_USER)
+    total_users = len(original_users)
+
+    for user in original_users:
+        if user.id in disconnected_ids:
+            impact.disconnected_user_ids.append(user.id)
+            impact.disconnected_user_names.append(user.name)
+            impact.affected_user_ids.append(user.id)
+            impact.affected_user_names.append(user.name)
+            impact.user_temp_changes[user.id] = -999.0
+            impact.user_pressure_changes[user.id] = -999.0
+            continue
+
+        orig_nr = original_results.node_results.get(user.id)
+        fault_nr = fault_results.node_results.get(user.id) if fault_results else None
+
+        if orig_nr and fault_nr:
+            temp_change = fault_nr.temperature - orig_nr.temperature
+            press_change = fault_nr.pressure - orig_nr.pressure
+
+            impact.user_temp_changes[user.id] = temp_change
+            impact.user_pressure_changes[user.id] = press_change
+
+            if abs(temp_change) > 0.1 or abs(press_change) > 0.5:
+                if user.id not in impact.affected_user_ids:
+                    impact.affected_user_ids.append(user.id)
+                    impact.affected_user_names.append(user.name)
+
+            if fault_nr.pressure < MIN_OPERATING_PRESSURE:
+                impact.low_pressure_users.append(user.id)
+                if user.id not in impact.affected_user_ids:
+                    impact.affected_user_ids.append(user.id)
+                    impact.affected_user_names.append(user.name)
+
+    impact.original_total_heat = original_results.total_heat_supplied if original_results else 0.0
+    impact.fault_total_heat = fault_results.total_heat_supplied if fault_results else 0.0
+    if impact.original_total_heat > 0:
+        impact.total_heat_capacity_drop_pct = (
+            (impact.original_total_heat - impact.fault_total_heat)
+            / impact.original_total_heat * 100.0
+        )
+
+    parts = []
+    parts.append(f"总用户数: {total_users}")
+    parts.append(f"受影响用户: {len(impact.affected_user_ids)} 人")
+    if impact.disconnected_user_ids:
+        parts.append(f"断供用户: {len(impact.disconnected_user_ids)} 人")
+    if impact.low_pressure_users:
+        parts.append(f"压力不达标用户: {len(impact.low_pressure_users)} 人")
+    parts.append(f"供热能力下降: {impact.total_heat_capacity_drop_pct:.1f}%")
+    impact.summary_text = " | ".join(parts)
+
+    return impact

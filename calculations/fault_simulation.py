@@ -444,3 +444,99 @@ def get_available_source_nodes(network: PipeNetwork) -> List[Node]:
 
 def get_available_pipes(network: PipeNetwork) -> List[Pipe]:
     return list(network.pipes.values())
+
+
+@dataclass
+class RiskAssessmentItem:
+    device_id: int
+    device_name: str
+    device_type: str
+    fault_probability: float
+    heat_capacity_drop_pct: float
+    risk_score: float
+
+
+def get_fault_probability(pipe_age: float = None, device_type: str = None) -> float:
+    if device_type == "泵站":
+        return 0.3
+    elif device_type == "热源":
+        return 0.15
+    elif device_type == "管段":
+        if pipe_age > 20:
+            return 0.8
+        elif pipe_age >= 10:
+            return 0.4
+        else:
+            return 0.1
+    return 0.0
+
+
+def calculate_risk_assessment(
+    original_network: PipeNetwork,
+    original_results: NetworkResults,
+    source_temps: Dict[int, float],
+) -> List[RiskAssessmentItem]:
+    risk_items: List[RiskAssessmentItem] = []
+    pipes = list(original_network.pipes.values())
+    pump_pipes = [p for p in pipes if p.has_pump]
+    source_nodes = original_network.get_nodes_by_type(NODE_TYPE_SOURCE)
+
+    for pipe in pipes:
+        try:
+            faults = [FaultConfig(fault_type=FAULT_TYPE_PIPE_BURST, target_id=pipe.id)]
+            _, impact, _ = simulate_faults(
+                original_network, original_results, faults, source_temps
+            )
+            prob = get_fault_probability(pipe_age=pipe.pipe_age, device_type="管段")
+            risk = impact.total_heat_capacity_drop_pct * prob
+            risk_items.append(RiskAssessmentItem(
+                device_id=pipe.id,
+                device_name=pipe.name,
+                device_type="管段",
+                fault_probability=prob,
+                heat_capacity_drop_pct=impact.total_heat_capacity_drop_pct,
+                risk_score=risk,
+            ))
+        except Exception:
+            pass
+
+    for pump_pipe in pump_pipes:
+        try:
+            faults = [FaultConfig(fault_type=FAULT_TYPE_PUMP_FAILURE, target_id=pump_pipe.id)]
+            _, impact, _ = simulate_faults(
+                original_network, original_results, faults, source_temps
+            )
+            prob = get_fault_probability(device_type="泵站")
+            risk = impact.total_heat_capacity_drop_pct * prob
+            risk_items.append(RiskAssessmentItem(
+                device_id=pump_pipe.id,
+                device_name=pump_pipe.name,
+                device_type="泵站",
+                fault_probability=prob,
+                heat_capacity_drop_pct=impact.total_heat_capacity_drop_pct,
+                risk_score=risk,
+            ))
+        except Exception:
+            pass
+
+    for src_node in source_nodes:
+        try:
+            faults = [FaultConfig(fault_type=FAULT_TYPE_SOURCE_SHUTDOWN, target_id=src_node.id)]
+            _, impact, _ = simulate_faults(
+                original_network, original_results, faults, source_temps
+            )
+            prob = get_fault_probability(device_type="热源")
+            risk = impact.total_heat_capacity_drop_pct * prob
+            risk_items.append(RiskAssessmentItem(
+                device_id=src_node.id,
+                device_name=src_node.name,
+                device_type="热源",
+                fault_probability=prob,
+                heat_capacity_drop_pct=impact.total_heat_capacity_drop_pct,
+                risk_score=risk,
+            ))
+        except Exception:
+            pass
+
+    risk_items.sort(key=lambda x: x.risk_score, reverse=True)
+    return risk_items

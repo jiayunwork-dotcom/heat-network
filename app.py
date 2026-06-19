@@ -21,13 +21,14 @@ from models import (
 from calculations import (
     solve_coupled, analyze_hydraulic_balance,
     optimize_source_allocation_equal, optimize_source_allocation_min_energy,
-    FaultConfig, ImpactAssessment,
+    FaultConfig, ImpactAssessment, RiskAssessmentItem,
     FAULT_TYPE_PIPE_BURST, FAULT_TYPE_PUMP_FAILURE, FAULT_TYPE_SOURCE_SHUTDOWN,
     FAULT_TYPE_CN, MIN_OPERATING_PRESSURE,
     simulate_faults,
     get_available_pump_pipes, get_available_source_nodes, get_available_pipes,
-    EmergencyAction, EmergencyPlan,
+    EmergencyAction, EmergencyPlan, RecoveryEffect,
     generate_emergency_plan, DEFAULT_TEMP_WARNING_THRESHOLD,
+    calculate_risk_assessment, execute_emergency_action,
 )
 from visualization import (
     create_network_topology_figure,
@@ -97,6 +98,22 @@ def init_session():
         st.session_state.fault_modified_network = None
     if "emergency_plan" not in st.session_state:
         st.session_state.emergency_plan = None
+    if "fault_history" not in st.session_state:
+        st.session_state.fault_history = []
+    if "recovery_effects" not in st.session_state:
+        st.session_state.recovery_effects = {}
+    if "recovery_current_results" not in st.session_state:
+        st.session_state.recovery_current_results = None
+    if "recovery_current_impact" not in st.session_state:
+        st.session_state.recovery_current_impact = None
+    if "recovery_current_network" not in st.session_state:
+        st.session_state.recovery_current_network = None
+    if "recovery_current_source_temps" not in st.session_state:
+        st.session_state.recovery_current_source_temps = None
+    if "risk_assessment_results" not in st.session_state:
+        st.session_state.risk_assessment_results = None
+    if "risk_mode_enabled" not in st.session_state:
+        st.session_state.risk_mode_enabled = False
 
 
 init_session()
@@ -1045,57 +1062,192 @@ with tabs[7]:
                     st.warning("所有热源均已设置为停机")
 
             st.divider()
-            col_run1, col_run2 = st.columns(2)
-            with col_run1:
-                run_fault = st.button(
-                    "🔄 运行故障模拟计算",
-                    type="primary",
-                    use_container_width=True,
-                    disabled=len(st.session_state.fault_list) == 0,
-                )
-            with col_run2:
-                if st.button("🔙 重置故障模拟", use_container_width=True):
-                    st.session_state.fault_results = None
-                    st.session_state.fault_impact = None
-                    st.session_state.fault_modified_network = None
-                    st.session_state.emergency_plan = None
-                    st.rerun()
+            risk_mode = st.checkbox(
+                "☢️ 风险评估模式（自动遍历所有设备计算风险排名）",
+                value=st.session_state.risk_mode_enabled,
+                help="勾选后系统自动遍历所有管段/泵站/热源，计算每个潜在故障点的风险评分",
+            )
+            st.session_state.risk_mode_enabled = risk_mode
 
-            if run_fault:
-                with st.spinner("🔬 正在进行故障工况水力热力耦合计算..."):
-                    try:
-                        fault_res, impact, modified_net = simulate_faults(
-                            net, normal_results,
-                            st.session_state.fault_list,
-                            st.session_state.source_temps,
-                        )
-                        st.session_state.fault_results = fault_res
-                        st.session_state.fault_impact = impact
-                        st.session_state.fault_modified_network = modified_net
-
-                        with st.spinner("📋 正在生成应急预案..."):
-                            plan, _, _ = generate_emergency_plan(
-                                net, modified_net, normal_results,
-                                fault_res, st.session_state.fault_list,
-                                impact, st.session_state.source_temps,
-                                min_temp_threshold=st.session_state.temp_threshold,
+            if risk_mode:
+                if st.button("🔍 开始风险评估计算", type="primary", use_container_width=True):
+                    with st.spinner("🔬 正在遍历所有设备进行风险评估计算，这可能需要一些时间..."):
+                        try:
+                            risk_items = calculate_risk_assessment(
+                                net, normal_results, st.session_state.source_temps,
                             )
-                            st.session_state.emergency_plan = plan
+                            st.session_state.risk_assessment_results = risk_items[:10]
+                            st.success(f"✅ 风险评估完成，共评估 {len(risk_items)} 个潜在故障点")
+                        except Exception as e:
+                            st.error(f"❌ 风险评估失败：{e}")
+                            import traceback
+                            with st.expander("错误详情"):
+                                st.code(traceback.format_exc())
+                if st.session_state.risk_assessment_results:
+                    st.divider()
+                    st.markdown("###### 📊 风险排名 Top 10")
+                    risk_rows = []
+                    for item in st.session_state.risk_assessment_results:
+                        risk_rows.append({
+                            "设备名称": item.device_name,
+                            "设备类型": item.device_type,
+                            "故障概率": f"{item.fault_probability*100:.0f}%",
+                            "供热能力下降(%)": f"{item.heat_capacity_drop_pct:.1f}%",
+                            "风险评分": f"{item.risk_score:.2f}",
+                        })
+                    df_risk = pd.DataFrame(risk_rows)
+                    st.dataframe(df_risk, use_container_width=True, hide_index=True, height=380)
 
-                        st.success("✅ 故障模拟与应急预案生成完成！")
-                    except Exception as e:
-                        st.error(f"❌ 故障模拟失败：{e}")
-                        import traceback
-                        with st.expander("错误详情"):
-                            st.code(traceback.format_exc())
+                    fig_risk = go.Figure()
+                    risk_names = [item.device_name for item in st.session_state.risk_assessment_results]
+                    risk_scores = [item.risk_score for item in st.session_state.risk_assessment_results]
+                    risk_colors = []
+                    for item in st.session_state.risk_assessment_results:
+                        if item.device_type == "管段":
+                            risk_colors.append("#e74c3c")
+                        elif item.device_type == "泵站":
+                            risk_colors.append("#f39c12")
+                        else:
+                            risk_colors.append("#3498db")
+                    fig_risk.add_trace(go.Bar(
+                        x=risk_names,
+                        y=risk_scores,
+                        marker_color=risk_colors,
+                        text=[f"{s:.2f}" for s in risk_scores],
+                        textposition='outside',
+                    ))
+                    fig_risk.update_layout(
+                        xaxis_title="设备名称",
+                        yaxis_title="风险评分",
+                        height=400,
+                        margin=dict(l=40, r=40, t=40, b=120),
+                        xaxis_tickangle=-30,
+                    )
+                    st.plotly_chart(fig_risk, use_container_width=True)
+                    st.caption("🔴 红色=管段 | 🟡 橙色=泵站 | 🔵 蓝色=热源")
+            else:
+                col_run1, col_run2 = st.columns(2)
+                with col_run1:
+                    run_fault = st.button(
+                        "🔄 运行故障模拟计算",
+                        type="primary",
+                        use_container_width=True,
+                        disabled=len(st.session_state.fault_list) == 0,
+                    )
+                with col_run2:
+                    if st.button("🔙 重置故障模拟", use_container_width=True):
+                        st.session_state.fault_results = None
+                        st.session_state.fault_impact = None
+                        st.session_state.fault_modified_network = None
+                        st.session_state.emergency_plan = None
+                        st.session_state.recovery_effects = {}
+                        st.session_state.recovery_current_results = None
+                        st.session_state.recovery_current_impact = None
+                        st.session_state.recovery_current_network = None
+                        st.session_state.recovery_current_source_temps = None
+                        st.rerun()
+
+                if run_fault:
+                    with st.spinner("🔬 正在进行故障工况水力热力耦合计算..."):
+                        try:
+                            fault_res, impact, modified_net = simulate_faults(
+                                net, normal_results,
+                                st.session_state.fault_list,
+                                st.session_state.source_temps,
+                            )
+                            st.session_state.fault_results = fault_res
+                            st.session_state.fault_impact = impact
+                            st.session_state.fault_modified_network = modified_net
+                            st.session_state.recovery_effects = {}
+                            st.session_state.recovery_current_results = fault_res
+                            st.session_state.recovery_current_impact = impact
+                            st.session_state.recovery_current_network = modified_net
+                            st.session_state.recovery_current_source_temps = dict(st.session_state.source_temps)
+
+                            with st.spinner("📋 正在生成应急预案..."):
+                                plan, _, _ = generate_emergency_plan(
+                                    net, modified_net, normal_results,
+                                    fault_res, st.session_state.fault_list,
+                                    impact, st.session_state.source_temps,
+                                    min_temp_threshold=st.session_state.temp_threshold,
+                                )
+                                st.session_state.emergency_plan = plan
+
+                            history_record = {
+                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "fault_descriptions": [f.describe(net) for f in st.session_state.fault_list],
+                                "impact": {
+                                    "affected_user_count": len(impact.affected_user_ids),
+                                    "disconnected_user_count": len(impact.disconnected_user_ids),
+                                    "total_heat_capacity_drop_pct": impact.total_heat_capacity_drop_pct,
+                                    "affected_user_ids": impact.affected_user_ids,
+                                    "affected_user_names": impact.affected_user_names,
+                                    "disconnected_user_ids": impact.disconnected_user_ids,
+                                    "disconnected_user_names": impact.disconnected_user_names,
+                                    "user_temp_changes": dict(impact.user_temp_changes),
+                                    "user_pressure_changes": dict(impact.user_pressure_changes),
+                                    "low_pressure_users": impact.low_pressure_users,
+                                    "summary_text": impact.summary_text,
+                                    "original_total_heat": impact.original_total_heat,
+                                    "fault_total_heat": impact.fault_total_heat,
+                                },
+                                "emergency_plan_actions": [
+                                    {
+                                        "priority": a.priority,
+                                        "action_type": a.action_type,
+                                        "target_id": a.target_id,
+                                        "target_name": a.target_name,
+                                        "description": a.description,
+                                        "detail": a.detail,
+                                        "estimated_effect": a.estimated_effect,
+                                    }
+                                    for a in (plan.actions if plan else [])
+                                ],
+                                "emergency_plan_summary": plan.summary if plan else "",
+                                "emergency_plan_warnings": plan.warnings if plan else [],
+                            }
+                            st.session_state.fault_history.insert(0, history_record)
+                            if len(st.session_state.fault_history) > 10:
+                                st.session_state.fault_history = st.session_state.fault_history[:10]
+
+                            st.success("✅ 故障模拟与应急预案生成完成！")
+                        except Exception as e:
+                            st.error(f"❌ 故障模拟失败：{e}")
+                            import traceback
+                            with st.expander("错误详情"):
+                                st.code(traceback.format_exc())
 
         with col_right:
             if st.session_state.fault_impact is None:
                 st.info("👈 请先在左侧添加故障并运行模拟计算")
             else:
+                display_impact: ImpactAssessment = (
+                    st.session_state.recovery_current_impact
+                    if st.session_state.recovery_current_impact is not None
+                    else st.session_state.fault_impact
+                )
+                display_results = (
+                    st.session_state.recovery_current_results
+                    if st.session_state.recovery_current_results is not None
+                    else st.session_state.fault_results
+                )
                 impact: ImpactAssessment = st.session_state.fault_impact
                 fault_results = st.session_state.fault_results
                 plan: EmergencyPlan = st.session_state.emergency_plan
+
+                show_recovery = (
+                    st.session_state.recovery_current_impact is not None
+                    and st.session_state.recovery_effects
+                )
+                if show_recovery:
+                    st.info("ℹ️ 当前显示应急措施执行后的恢复效果，点击下方'重置恢复效果'可返回故障初始状态")
+                    if st.button("🔄 重置恢复效果", use_container_width=True):
+                        st.session_state.recovery_effects = {}
+                        st.session_state.recovery_current_results = st.session_state.fault_results
+                        st.session_state.recovery_current_impact = st.session_state.fault_impact
+                        st.session_state.recovery_current_network = st.session_state.fault_modified_network
+                        st.session_state.recovery_current_source_temps = dict(st.session_state.source_temps)
+                        st.rerun()
 
                 st.markdown("##### 📊 故障影响评估汇总")
                 m1, m2, m3, m4 = st.columns(4)
@@ -1103,32 +1255,32 @@ with tabs[7]:
                 with m1:
                     st.metric(
                         "受影响用户",
-                        f"{len(impact.affected_user_ids)}/{total_users}",
-                        delta=f"{len(impact.affected_user_ids)/max(total_users,1)*100:.0f}%"
+                        f"{len(display_impact.affected_user_ids)}/{total_users}",
+                        delta=f"{len(display_impact.affected_user_ids)/max(total_users,1)*100:.0f}%"
                     )
                 with m2:
                     st.metric(
                         "断供用户",
-                        f"{len(impact.disconnected_user_ids)}",
+                        f"{len(display_impact.disconnected_user_ids)}",
                         delta_color="inverse"
                     )
                 with m3:
                     st.metric(
                         "压力不达标",
-                        f"{len(impact.low_pressure_users)}",
+                        f"{len(display_impact.low_pressure_users)}",
                         delta=f"<{MIN_OPERATING_PRESSURE}mH₂O",
                         delta_color="off"
                     )
                 with m4:
                     st.metric(
                         "供热能力下降",
-                        f"{impact.total_heat_capacity_drop_pct:.1f}%",
+                        f"{display_impact.total_heat_capacity_drop_pct:.1f}%",
                         delta_color="inverse"
                     )
 
                 st.divider()
-                tab_compare, tab_topo, tab_plan = st.tabs([
-                    "📋 正常vs故障对比", "🗺️ 故障拓扑图", "🚒 应急预案"
+                tab_compare, tab_topo, tab_plan, tab_history = st.tabs([
+                    "📋 正常vs故障对比", "🗺️ 故障拓扑图", "🚒 应急预案", "📜 历史记录"
                 ])
 
                 with tab_compare:
@@ -1137,10 +1289,10 @@ with tabs[7]:
                     compare_rows = []
                     for user in end_users:
                         nr_normal = normal_results.node_results.get(user.id)
-                        nr_fault = fault_results.node_results.get(user.id) if fault_results else None
-                        is_disconnected = user.id in impact.disconnected_user_ids
-                        is_low_p = user.id in impact.low_pressure_users
-                        is_affected = user.id in impact.affected_user_ids
+                        nr_fault = display_results.node_results.get(user.id) if display_results else None
+                        is_disconnected = user.id in display_impact.disconnected_user_ids
+                        is_low_p = user.id in display_impact.low_pressure_users
+                        is_affected = user.id in display_impact.affected_user_ids
 
                         temp_normal = nr_normal.temperature if nr_normal else 0.0
                         press_normal = nr_normal.pressure if nr_normal else 0.0
@@ -1212,23 +1364,19 @@ with tabs[7]:
                     st.markdown("###### 📈 关键指标对比")
                     metric_compare = [
                         ["总供热量 (MW)",
-                         f"{impact.original_total_heat/1e6:.2f}",
-                         f"{impact.fault_total_heat/1e6:.2f}" if fault_results else "计算失败",
-                         f"{-impact.total_heat_capacity_drop_pct:.1f}%"],
-                        ["最大管段压降变化 (kPa)",
-                         "--",
-                         f"{impact.max_pressure_drop_change/1000:.2f}" if fault_results else "--",
-                         f"{impact.max_pressure_drop_change/1000:+.2f}"],
+                         f"{display_impact.original_total_heat/1e6:.2f}",
+                         f"{display_impact.fault_total_heat/1e6:.2f}" if display_results else "计算失败",
+                         f"{-display_impact.total_heat_capacity_drop_pct:.1f}%"],
                         ["受影响用户数", "0",
-                         f"{len(impact.affected_user_ids)}",
-                         f"+{len(impact.affected_user_ids)}"],
+                         f"{len(display_impact.affected_user_ids)}",
+                         f"+{len(display_impact.affected_user_ids)}"],
                         ["断供用户数", "0",
-                         f"{len(impact.disconnected_user_ids)}",
-                         f"+{len(impact.disconnected_user_ids)}"],
+                         f"{len(display_impact.disconnected_user_ids)}",
+                         f"+{len(display_impact.disconnected_user_ids)}"],
                         ["压力低于20mH₂O用户数",
                          f"{sum(1 for u in end_users if (normal_results.node_results.get(u.id) and normal_results.node_results[u.id].pressure < MIN_OPERATING_PRESSURE))}",
-                         f"{len(impact.low_pressure_users)}",
-                         f"+{max(0, len(impact.low_pressure_users) - sum(1 for u in end_users if (normal_results.node_results.get(u.id) and normal_results.node_results[u.id].pressure < MIN_OPERATING_PRESSURE)))}"],
+                         f"{len(display_impact.low_pressure_users)}",
+                         f"+{max(0, len(display_impact.low_pressure_users) - sum(1 for u in end_users if (normal_results.node_results.get(u.id) and normal_results.node_results[u.id].pressure < MIN_OPERATING_PRESSURE)))}"],
                     ]
                     df_metric = pd.DataFrame(metric_compare, columns=["指标", "正常工况", "故障工况", "变化"])
                     st.dataframe(df_metric, use_container_width=True, hide_index=True)
@@ -1237,8 +1385,8 @@ with tabs[7]:
                     if st.session_state.fault_modified_network is not None:
                         with st.spinner("绘制故障拓扑图..."):
                             fig_fault = create_fault_topology_figure(
-                                net, fault_results,
-                                impact, st.session_state.fault_list,
+                                net, display_results,
+                                display_impact, st.session_state.fault_list,
                                 normal_results,
                             )
                             st.plotly_chart(fig_fault, use_container_width=True)
@@ -1255,15 +1403,119 @@ with tabs[7]:
 
                         sorted_actions = plan.sorted_actions()
                         priority_labels = {1: "🔴 紧急", 2: "🟠 高", 3: "🟡 中", 4: "🔵 低"}
-                        for action in sorted_actions:
+                        for action_idx, action in enumerate(sorted_actions):
                             p_label = priority_labels.get(action.priority, f"优先级{action.priority}")
-                            with st.expander(f"{p_label} | {action.description}", expanded=(action.priority <= 2)):
+                            executed = action_idx in st.session_state.recovery_effects
+                            status_icon = "✅" if executed else "⏳"
+                            with st.expander(f"{status_icon} {p_label} | {action.description}", expanded=(action.priority <= 2)):
                                 st.markdown(f"**措施类型**: {action.action_type}")
                                 st.markdown(f"**实施对象**: {action.target_name} (ID:{action.target_id})")
                                 if action.detail:
                                     st.markdown(f"**详细说明**: {action.detail}")
                                 if action.estimated_effect:
                                     st.success(f"💡 预期效果: {action.estimated_effect}")
+
+                                can_simulate = (
+                                    action.suggested_params
+                                    and action.suggested_params.get("action", "") in [
+                                        "increase_source_temp", "increase_pump_head",
+                                        "switch_path", "isolate_pipe"
+                                    ]
+                                )
+                                if can_simulate and not executed:
+                                    if st.button(
+                                        "▶️ 模拟执行",
+                                        key=f"sim_action_{action_idx}",
+                                        use_container_width=True,
+                                        type="primary",
+                                    ):
+                                        with st.spinner("🔬 正在模拟执行该应急措施..."):
+                                            curr_net = (
+                                                st.session_state.recovery_current_network
+                                                if st.session_state.recovery_current_network is not None
+                                                else st.session_state.fault_modified_network
+                                            )
+                                            curr_res = (
+                                                st.session_state.recovery_current_results
+                                                if st.session_state.recovery_current_results is not None
+                                                else st.session_state.fault_results
+                                            )
+                                            curr_impact = (
+                                                st.session_state.recovery_current_impact
+                                                if st.session_state.recovery_current_impact is not None
+                                                else st.session_state.fault_impact
+                                            )
+                                            curr_st = (
+                                                st.session_state.recovery_current_source_temps
+                                                if st.session_state.recovery_current_source_temps is not None
+                                                else st.session_state.source_temps
+                                            )
+                                            effect = execute_emergency_action(
+                                                net, normal_results,
+                                                curr_net, curr_res,
+                                                curr_impact, curr_st,
+                                                action,
+                                                st.session_state.fault_list,
+                                                action_idx,
+                                            )
+                                            if effect is not None:
+                                                st.session_state.recovery_effects[action_idx] = effect
+                                                st.session_state.recovery_current_results = effect.updated_results
+                                                st.session_state.recovery_current_impact = effect.updated_impact
+                                                st.session_state.recovery_current_network = effect.updated_network
+                                                st.session_state.recovery_current_source_temps = effect.updated_source_temps
+                                                st.success("✅ 模拟执行完成！上方影响评估已更新")
+                                                st.rerun()
+                                            else:
+                                                st.error("❌ 该措施暂不支持模拟执行")
+
+                                if executed:
+                                    effect: RecoveryEffect = st.session_state.recovery_effects[action_idx]
+                                    st.markdown("---")
+                                    st.markdown("###### ✅ 执行后恢复效果")
+                                    e1, e2 = st.columns(2)
+                                    with e1:
+                                        st.metric(
+                                            "平均温度提升",
+                                            f"{effect.recovered_temp_avg - effect.original_temp_avg:+.1f}°C"
+                                        )
+                                    with e2:
+                                        st.metric(
+                                            "与正常工况温度差距缩小",
+                                            f"{effect.temp_gap_reduction_pct:.0f}%"
+                                            if effect.temp_gap_reduction_pct > 0
+                                            else "0%"
+                                        )
+                                    e3, e4 = st.columns(2)
+                                    with e3:
+                                        st.metric(
+                                            "平均压力提升",
+                                            f"{effect.recovered_pressure_avg - effect.original_pressure_avg:+.2f}mH₂O"
+                                        )
+                                    with e4:
+                                        st.metric(
+                                            "与正常工况压力差距缩小",
+                                            f"{effect.pressure_gap_reduction_pct:.0f}%"
+                                            if effect.pressure_gap_reduction_pct > 0
+                                            else "0%"
+                                        )
+
+                                    if effect.user_temp_changes:
+                                        st.markdown("###### 📋 各用户温度变化")
+                                        user_changes = []
+                                        end_user_map = {u.id: u.name for u in end_users}
+                                        for uid, tchange in effect.user_temp_changes.items():
+                                            if abs(tchange) > 0.05:
+                                                user_changes.append({
+                                                    "用户名称": end_user_map.get(uid, f"用户{uid}"),
+                                                    "温度变化(°C)": f"{tchange:+.2f}",
+                                                })
+                                        if user_changes:
+                                            st.dataframe(
+                                                pd.DataFrame(user_changes),
+                                                use_container_width=True, hide_index=True,
+                                                height=200,
+                                            )
 
                         st.divider()
                         st.markdown("""
@@ -1276,6 +1528,262 @@ with tabs[7]:
                         """)
                     else:
                         st.info("暂无应急预案内容")
+
+                with tab_history:
+                    if not st.session_state.fault_history:
+                        st.info("💡 暂无历史记录，运行故障模拟后结果会自动保存（最多10条）")
+                    else:
+                        st.markdown(f"###### 📜 故障模拟历史记录（共 {len(st.session_state.fault_history)} 条）")
+                        compare_mode = st.checkbox("🔀 并排对比模式（选择两条记录进行对比）", value=False)
+                        st.divider()
+
+                        if compare_mode:
+                            history_options = [
+                                f"[{h['timestamp']}] {' + '.join(h['fault_descriptions'])}"
+                                for h in st.session_state.fault_history
+                            ]
+                            col_sel1, col_sel2 = st.columns(2)
+                            with col_sel1:
+                                sel_a = st.selectbox(
+                                    "选择记录 A",
+                                    range(len(st.session_state.fault_history)),
+                                    format_func=lambda i: history_options[i],
+                                    key="hist_compare_a",
+                                )
+                            with col_sel2:
+                                default_b = min(1, len(st.session_state.fault_history) - 1)
+                                sel_b = st.selectbox(
+                                    "选择记录 B",
+                                    range(len(st.session_state.fault_history)),
+                                    format_func=lambda i: history_options[i],
+                                    index=default_b if default_b != sel_a else 0,
+                                    key="hist_compare_b",
+                                )
+                            if sel_a == sel_b:
+                                st.warning("⚠️ 请选择两条不同的记录进行对比")
+                            else:
+                                rec_a = st.session_state.fault_history[sel_a]
+                                rec_b = st.session_state.fault_history[sel_b]
+                                st.divider()
+                                st.markdown("###### 📊 关键指标对比")
+                                comp_cols = st.columns(2)
+                                with comp_cols[0]:
+                                    st.info(f"**记录 A**: {rec_a['timestamp']}")
+                                with comp_cols[1]:
+                                    st.info(f"**记录 B**: {rec_b['timestamp']}")
+
+                                metric_names = ["受影响用户数", "断供用户数", "供热能力下降(%)"]
+                                val_a = [
+                                    rec_a["impact"]["affected_user_count"],
+                                    rec_a["impact"]["disconnected_user_count"],
+                                    f"{rec_a['impact']['total_heat_capacity_drop_pct']:.1f}",
+                                ]
+                                val_b = [
+                                    rec_b["impact"]["affected_user_count"],
+                                    rec_b["impact"]["disconnected_user_count"],
+                                    f"{rec_b['impact']['total_heat_capacity_drop_pct']:.1f}",
+                                ]
+                                comp_table = []
+                                for i, mn in enumerate(metric_names):
+                                    va = val_a[i]
+                                    vb = val_b[i]
+                                    try:
+                                        diff = float(vb) - float(va)
+                                        diff_str = f"{diff:+.1f}" if "." in str(va) else f"{int(diff):+d}"
+                                    except (ValueError, TypeError):
+                                        diff_str = "-"
+                                    comp_table.append({
+                                        "指标": mn,
+                                        f"记录A ({rec_a['timestamp']})": va,
+                                        f"记录B ({rec_b['timestamp']})": vb,
+                                    })
+                                df_comp = pd.DataFrame(comp_table)
+
+                                def style_compare(row):
+                                    res = [""] * len(df_comp.columns)
+                                    try:
+                                        va = float(row.iloc[1]) if isinstance(row.iloc[1], str) and row.iloc[1].replace('.', '', 1).lstrip('-').isdigit() else None
+                                        vb = float(row.iloc[2]) if isinstance(row.iloc[2], str) and row.iloc[2].replace('.', '', 1).lstrip('-').isdigit() else None
+                                        if va is not None and vb is not None:
+                                            if va < vb:
+                                                res[1] = "background-color: #ccffcc; color: #006600; font-weight: bold"
+                                                res[2] = "background-color: #ffcccc; color: #cc0000; font-weight: bold"
+                                            elif va > vb:
+                                                res[1] = "background-color: #ffcccc; color: #cc0000; font-weight: bold"
+                                                res[2] = "background-color: #ccffcc; color: #006600; font-weight: bold"
+                                    except Exception:
+                                        pass
+                                    return res
+
+                                styled_df_comp = df_comp.style.apply(style_compare, axis=1)
+                                st.dataframe(styled_df_comp, use_container_width=True, hide_index=True)
+                                st.caption("🟢 绿色=较优（影响较小） | 🔴 红色=较差（影响较大）")
+
+                                st.divider()
+                                st.markdown("###### 👥 各用户影响对比（红绿色标注差异）")
+                                end_users_map = {u.id: u.name for u in net.get_nodes_by_type(NODE_TYPE_END_USER)}
+                                user_diff_rows = []
+                                all_uids = sorted(set(list(rec_a["impact"]["user_temp_changes"].keys()) +
+                                                    list(rec_b["impact"]["user_temp_changes"].keys())))
+                                for uid in all_uids:
+                                    uname = end_users_map.get(uid, f"用户{uid}")
+                                    disc_a = uid in rec_a["impact"]["disconnected_user_ids"]
+                                    disc_b = uid in rec_b["impact"]["disconnected_user_ids"]
+                                    t_a = rec_a["impact"]["user_temp_changes"].get(uid, 0.0)
+                                    t_b = rec_b["impact"]["user_temp_changes"].get(uid, 0.0)
+                                    p_a = rec_a["impact"]["user_pressure_changes"].get(uid, 0.0)
+                                    p_b = rec_b["impact"]["user_pressure_changes"].get(uid, 0.0)
+
+                                    if disc_a and disc_b:
+                                        s_a = "❌ 断供"
+                                        s_b = "❌ 断供"
+                                        diff_flag = "same"
+                                    elif disc_a:
+                                        s_a = "❌ 断供"
+                                        s_b = f"{t_b:+.1f}°C"
+                                        diff_flag = "b_better"
+                                    elif disc_b:
+                                        s_a = f"{t_a:+.1f}°C"
+                                        s_b = "❌ 断供"
+                                        diff_flag = "a_better"
+                                    else:
+                                        s_a = f"{t_a:+.1f}°C"
+                                        s_b = f"{t_b:+.1f}°C"
+                                        if abs(t_a - t_b) < 0.1:
+                                            diff_flag = "same"
+                                        elif t_a > t_b:
+                                            diff_flag = "a_better"
+                                        else:
+                                            diff_flag = "b_better"
+
+                                    user_diff_rows.append({
+                                        "用户名称": uname,
+                                        "A温度变化": s_a,
+                                        "B温度变化": s_b,
+                                        "_diff": diff_flag,
+                                    })
+
+                                def style_user_diff(x):
+                                    styles = pd.DataFrame("", index=x.index, columns=df_user_diff_display.columns)
+                                    for idx, r in enumerate(user_diff_rows):
+                                        if r["_diff"] == "a_better":
+                                            styles.loc[idx, "A温度变化"] = "background-color: #ccffcc; color: #006600; font-weight: bold"
+                                            styles.loc[idx, "B温度变化"] = "background-color: #ffcccc; color: #cc0000; font-weight: bold"
+                                        elif r["_diff"] == "b_better":
+                                            styles.loc[idx, "A温度变化"] = "background-color: #ffcccc; color: #cc0000; font-weight: bold"
+                                            styles.loc[idx, "B温度变化"] = "background-color: #ccffcc; color: #006600; font-weight: bold"
+                                    return styles
+
+                                df_user_diff_display = pd.DataFrame([{
+                                    k: v for k, v in r.items() if not k.startswith("_")
+                                } for r in user_diff_rows])
+                                styled_user_diff = df_user_diff_display.style.apply(style_user_diff, axis=None)
+                                st.dataframe(styled_user_diff, use_container_width=True, hide_index=True, height=400)
+                                st.caption("🟢 绿色=较优（温度下降更少或正常供热） | 🔴 红色=较差（温度下降更多或断供）")
+
+                                st.divider()
+                                col_plan_a, col_plan_b = st.columns(2)
+                                with col_plan_a:
+                                    st.markdown(f"###### 📋 记录A 应急预案")
+                                    st.markdown(f"**摘要**: {rec_a.get('emergency_plan_summary', '')}")
+                                    for w in rec_a.get("emergency_plan_warnings", []):
+                                        st.warning(f"⚠️ {w}")
+                                    for act in rec_a.get("emergency_plan_actions", [])[:10]:
+                                        p_label = priority_labels.get(act["priority"], f"优先级{act['priority']}")
+                                        with st.expander(f"{p_label} | {act['description']}", expanded=False):
+                                            st.markdown(f"**措施类型**: {act['action_type']}")
+                                            st.markdown(f"**实施对象**: {act['target_name']} (ID:{act['target_id']})")
+                                            if act.get("detail"):
+                                                st.markdown(f"**详细说明**: {act['detail']}")
+                                with col_plan_b:
+                                    st.markdown(f"###### 📋 记录B 应急预案")
+                                    st.markdown(f"**摘要**: {rec_b.get('emergency_plan_summary', '')}")
+                                    for w in rec_b.get("emergency_plan_warnings", []):
+                                        st.warning(f"⚠️ {w}")
+                                    for act in rec_b.get("emergency_plan_actions", [])[:10]:
+                                        p_label = priority_labels.get(act["priority"], f"优先级{act['priority']}")
+                                        with st.expander(f"{p_label} | {act['description']}", expanded=False):
+                                            st.markdown(f"**措施类型**: {act['action_type']}")
+                                            st.markdown(f"**实施对象**: {act['target_name']} (ID:{act['target_id']})")
+                                            if act.get("detail"):
+                                                st.markdown(f"**详细说明**: {act['detail']}")
+                        else:
+                            for hi, record in enumerate(st.session_state.fault_history):
+                                with st.container():
+                                    col_ts, col_recall = st.columns([3, 1])
+                                    with col_ts:
+                                        st.markdown(
+                                            f"🕒 **{record['timestamp']}**  |  "
+                                            f"{' + '.join(record['fault_descriptions'])}"
+                                        )
+                                    with col_recall:
+                                        if st.button("📂 回显详情", key=f"recall_{hi}", use_container_width=True):
+                                            st.session_state["_pending_recall"] = hi
+                                            st.rerun()
+
+                                    sum_c1, sum_c2, sum_c3 = st.columns(3)
+                                    with sum_c1:
+                                        st.caption(
+                                            f"受影响用户: **{record['impact']['affected_user_count']}** 人"
+                                        )
+                                    with sum_c2:
+                                        st.caption(
+                                            f"断供用户: **{record['impact']['disconnected_user_count']}** 人"
+                                        )
+                                    with sum_c3:
+                                        st.caption(
+                                            f"供热能力下降: **{record['impact']['total_heat_capacity_drop_pct']:.1f}%**"
+                                        )
+
+                                    if st.session_state.get("_pending_recall") == hi:
+                                        st.divider()
+                                        st.markdown("###### 📋 回显详情")
+                                        st.markdown(f"**摘要**: {record['impact']['summary_text']}")
+                                        st.markdown("###### 👥 影响评估报告")
+                                        recall_rows = []
+                                        end_users_map = {u.id: u.name for u in net.get_nodes_by_type(NODE_TYPE_END_USER)}
+                                        for uid in sorted(record["impact"]["user_temp_changes"].keys()):
+                                            uname = end_users_map.get(uid, f"用户{uid}")
+                                            disc = uid in record["impact"]["disconnected_user_ids"]
+                                            lowp = uid in record["impact"]["low_pressure_users"]
+                                            t_chg = record["impact"]["user_temp_changes"][uid]
+                                            p_chg = record["impact"]["user_pressure_changes"][uid]
+                                            if disc:
+                                                status = "❌ 断供"
+                                            elif lowp:
+                                                status = "⚠️ 压力不足"
+                                            elif abs(t_chg) > 0.1 or abs(p_chg) > 0.5:
+                                                status = "🔶 受影响"
+                                            else:
+                                                status = "✅ 正常"
+                                            recall_rows.append({
+                                                "用户名称": uname,
+                                                "温度变化(°C)": "--" if disc else f"{t_chg:+.1f}",
+                                                "压力变化(mH₂O)": "--" if disc else f"{p_chg:+.2f}",
+                                                "状态": status,
+                                            })
+                                        st.dataframe(
+                                            pd.DataFrame(recall_rows),
+                                            use_container_width=True, hide_index=True,
+                                            height=300,
+                                        )
+
+                                        st.markdown("###### 🚒 应急预案")
+                                        st.markdown(f"**摘要**: {record.get('emergency_plan_summary', '')}")
+                                        for w in record.get("emergency_plan_warnings", []):
+                                            st.warning(f"⚠️ {w}")
+                                        priority_labels = {1: "🔴 紧急", 2: "🟠 高", 3: "🟡 中", 4: "🔵 低"}
+                                        for act in record.get("emergency_plan_actions", []):
+                                            p_label = priority_labels.get(act["priority"], f"优先级{act['priority']}")
+                                            with st.expander(f"{p_label} | {act['description']}", expanded=False):
+                                                st.markdown(f"**措施类型**: {act['action_type']}")
+                                                st.markdown(f"**实施对象**: {act['target_name']} (ID:{act['target_id']})")
+                                                if act.get("detail"):
+                                                    st.markdown(f"**详细说明**: {act['detail']}")
+                                                if act.get("estimated_effect"):
+                                                    st.success(f"💡 预期效果: {act['estimated_effect']}")
+                                        st.session_state["_pending_recall"] = None
+                                    st.divider()
 
 with tabs[8]:
     st.subheader("📝 管网数据编辑")
