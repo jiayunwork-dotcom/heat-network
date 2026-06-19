@@ -8,6 +8,7 @@ import numpy as np
 import json
 import io
 from datetime import datetime
+import plotly.graph_objects as go
 
 from models import (
     PipeNetwork, Node, Pipe, NetworkResults, PipeSectionResult,
@@ -74,6 +75,10 @@ def init_session():
         st.session_state.source_ratios = None
     if "source_temps" not in st.session_state:
         st.session_state.source_temps = {}
+    if "saved_conditions" not in st.session_state:
+        st.session_state.saved_conditions = {}
+    if "temp_threshold" not in st.session_state:
+        st.session_state.temp_threshold = 65.0
 
 
 init_session()
@@ -183,6 +188,95 @@ with st.sidebar:
     st.divider()
     st.subheader("4. 执行计算")
     run_btn = st.button("▶️ 开始水力热力耦合计算", type="primary", use_container_width=True)
+    st.divider()
+    st.subheader("5. 工况管理")
+    cond_count = len(st.session_state.saved_conditions)
+    st.caption(f"已保存工况：{cond_count}/5")
+    with st.form("save_condition_form", clear_on_submit=True):
+        cond_name = st.text_input("工况名称", placeholder="例如：设计工况、极寒工况、检修工况")
+        save_cond = st.form_submit_button("💾 保存当前工况", use_container_width=True)
+    if save_cond:
+        if not cond_name.strip():
+            st.error("❌ 请输入工况名称")
+        elif cond_name in st.session_state.saved_conditions:
+            st.error(f"❌ 工况名称 '{cond_name}' 已存在")
+        elif cond_count >= 5:
+            st.error("❌ 最多只能保存5个工况，请先删除不需要的工况")
+        elif st.session_state.results is None:
+            st.error("❌ 请先运行计算后再保存工况")
+        else:
+            net = st.session_state.network
+            r = st.session_state.results
+            user_flow_demands = {}
+            for uid, user in enumerate(net.get_nodes_by_type(NODE_TYPE_END_USER), 1):
+                user_flow_demands[user.id] = user.design_flow or 0.0
+            condition_data = {
+                "saved_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "input_params": {
+                    "environment_temperature": net.environment_temperature,
+                    "water_specific_heat": net.water_specific_heat,
+                    "source_temps": dict(st.session_state.source_temps),
+                    "dispatch_strategy": dispatch_strategy,
+                    "balance_tolerance": balance_tolerance,
+                    "user_flow_demands": user_flow_demands,
+                },
+                "results_summary": {
+                    "total_heat_supplied": r.total_heat_supplied,
+                    "total_heat_loss": r.total_heat_loss,
+                    "heat_loss_rate": r.heat_loss_rate,
+                    "total_pump_power": r.total_pump_power,
+                    "specific_energy_consumption": r.specific_energy_consumption,
+                    "iterations": r.iterations,
+                    "converged": r.converged,
+                },
+                "source_ratios": dict(st.session_state.source_ratios) if st.session_state.source_ratios else {},
+                "pipe_results": {str(pid): {
+                    "flow_rate": pr.flow_rate,
+                    "inlet_temperature": pr.inlet_temperature,
+                    "outlet_temperature": pr.outlet_temperature,
+                    "temperature_drop": pr.temperature_drop,
+                    "heat_loss": pr.heat_loss,
+                    "pressure_loss": pr.pressure_loss,
+                    "total_pressure_loss": pr.total_pressure_loss,
+                    "power_consumption": pr.power_consumption,
+                    "pump_head": pr.pump_head,
+                } for pid, pr in r.pipe_results.items()},
+                "node_results": {str(nid): {
+                    "pressure": nr.pressure,
+                    "temperature": nr.temperature,
+                    "flow_in": nr.flow_in,
+                    "flow_out": nr.flow_out,
+                } for nid, nr in r.node_results.items()},
+            }
+            st.session_state.saved_conditions[cond_name.strip()] = condition_data
+            st.success(f"✅ 工况 '{cond_name.strip()}' 保存成功！")
+    st.divider()
+    if st.session_state.saved_conditions:
+        st.markdown("###### 已保存工况列表")
+        for cname in list(st.session_state.saved_conditions.keys()):
+            cdata = st.session_state.saved_conditions[cname]
+            with st.expander(f"📋 {cname}"):
+                st.caption(f"保存时间: {cdata['saved_time']}")
+                ip = cdata["input_params"]
+                rs = cdata["results_summary"]
+                col_c1, col_c2 = st.columns(2)
+                with col_c1:
+                    st.caption("**输入参数**")
+                    st.write(f"环境温度: {ip['environment_temperature']}°C")
+                    st.write(f"热源数: {len(ip['source_temps'])}")
+                    for si, (sid, stv) in enumerate(ip["source_temps"].items()):
+                        st.write(f"  热源{sid}: {stv}°C")
+                with col_c2:
+                    st.caption("**关键指标**")
+                    st.write(f"总供热量: {rs['total_heat_supplied']/1e6:.2f} MW")
+                    st.write(f"热损失率: {rs['heat_loss_rate']:.2f}%")
+                    st.write(f"泵耗电: {rs['total_pump_power']:.1f} kW")
+                if st.button(f"🗑️ 删除 '{cname}'", key=f"del_cond_{cname}", use_container_width=True):
+                    del st.session_state.saved_conditions[cname]
+                    st.success(f"✅ 工况 '{cname}' 已删除")
+                    st.rerun()
+    else:
+        st.info("💡 运行计算后可在此保存工况，最多保存5个")
 
 if run_btn and st.session_state.network is not None:
     st.session_state.network.environment_temperature = env_temp
@@ -217,7 +311,7 @@ if run_btn and st.session_state.network is not None:
 tabs = st.tabs([
     "📊 总览仪表盘", "🌐 管网拓扑与可视化", "💧 水力计算结果",
     "🌡️ 热力计算结果", "⚡ 能耗分析", "🔧 水力平衡与优化",
-    "📝 管网数据编辑", "📄 报告导出"
+    "📈 工况对比", "📝 管网数据编辑", "📄 报告导出"
 ])
 
 with tabs[0]:
@@ -377,6 +471,34 @@ with tabs[3]:
     else:
         net = st.session_state.network
         r = st.session_state.results
+        temp_threshold = st.number_input(
+            "⚠️ 温度预警阈值 (°C)",
+            min_value=30.0, max_value=100.0,
+            value=st.session_state.temp_threshold,
+            step=1.0,
+            help="末端用户供水温度低于此值时触发告警",
+        )
+        st.session_state.temp_threshold = float(temp_threshold)
+
+        end_user_nodes = net.get_nodes_by_type(NODE_TYPE_END_USER)
+        low_temp_users = []
+        for user in end_user_nodes:
+            nr = r.node_results.get(user.id)
+            if nr and nr.temperature < temp_threshold:
+                low_temp_users.append({
+                    "id": user.id,
+                    "name": user.name,
+                    "temperature": nr.temperature,
+                })
+
+        if low_temp_users:
+            user_names = "、".join([f"{u['name']}(供水温度{u['temperature']:.1f}°C)" for u in low_temp_users])
+            st.error(
+                f"🚨 温度预警：共有 {len(low_temp_users)} 个末端用户供水温度低于 {temp_threshold}°C 阈值！\n\n"
+                f"供温不达标用户：{user_names}",
+                icon="⚠️"
+            )
+
         th_rows = []
         total_hl = 0.0
         for pid, pr in r.pipe_results.items():
@@ -401,19 +523,48 @@ with tabs[3]:
         df_th = pd.DataFrame(th_rows)
         st.dataframe(df_th, use_container_width=True, hide_index=True, height=440)
         st.divider()
-        tn_rows = []
+        tn_rows_data = []
+        low_temp_ids = set(u["id"] for u in low_temp_users)
         for nid, nr in r.node_results.items():
             node = net.nodes[nid]
-            tn_rows.append({
+            tn_rows_data.append({
                 "节点编号": nid,
                 "节点名称": node.name,
                 "类型": NODE_TYPE_CN.get(node.type, node.type),
-                "温度(°C)": f"{nr.temperature:.2f}",
-                "温差(与环境)": f"{nr.temperature - net.environment_temperature:.1f}°C",
+                "温度(°C)": nr.temperature,
+                "温差(与环境)": nr.temperature - net.environment_temperature,
+                "_is_low_temp": (node.type == NODE_TYPE_END_USER and nid in low_temp_ids),
             })
         st.markdown("##### 🌡️ 各节点温度分布")
-        df_tn = pd.DataFrame(tn_rows)
-        st.dataframe(df_tn, use_container_width=True, hide_index=True, height=380)
+
+        def highlight_temp(row):
+            if row["_is_low_temp"]:
+                return ["background-color: #ffcccc; color: #cc0000; font-weight: bold" for _ in row]
+            return ["" for _ in row]
+
+        df_tn_display = pd.DataFrame([{
+            "节点编号": r["节点编号"],
+            "节点名称": r["节点名称"],
+            "类型": r["类型"],
+            "温度(°C)": f"{r['温度(°C)']:.2f}",
+            "温差(与环境)": f"{r['温差(与环境)']:.1f}°C",
+        } for r in tn_rows_data])
+
+        df_tn_style = pd.DataFrame(tn_rows_data)
+
+        def apply_temp_style(x):
+            styles = pd.DataFrame("", index=x.index, columns=df_tn_display.columns)
+            for idx, rdata in enumerate(tn_rows_data):
+                if rdata["_is_low_temp"]:
+                    styles.loc[idx, :] = "background-color: #ffcccc; color: #cc0000; font-weight: bold"
+            return styles
+
+        styled_tn = df_tn_display.style.apply(apply_temp_style, axis=None)
+        st.dataframe(styled_tn, use_container_width=True, hide_index=True, height=380)
+
+        if low_temp_users:
+            st.info(f"💡 提示：红色标红行表示末端用户供水温度低于 {temp_threshold}°C 的预警阈值")
+
         csv_th = df_th.to_csv(index=False).encode('utf-8-sig')
         st.download_button("📥 下载热力计算结果(CSV)", csv_th,
                            file_name="热力计算结果.csv", mime="text/csv")
@@ -535,6 +686,244 @@ with tabs[5]:
             st.success("✅ 所有末端用户流量偏差均在允许范围内，水力平衡状态良好，无需阀门调节。")
 
 with tabs[6]:
+    st.subheader("📈 工况对比分析")
+    if not st.session_state.saved_conditions:
+        st.info("💡 请先在侧边栏保存至少2个工况后再进行对比分析")
+    else:
+        cond_names = list(st.session_state.saved_conditions.keys())
+        default_sel = cond_names[:min(2, len(cond_names))] if len(cond_names) >= 2 else cond_names
+        selected_conds = st.multiselect(
+            "选择需要对比的工况（2-3个）",
+            cond_names,
+            default=default_sel,
+            max_selections=3,
+        )
+        if len(selected_conds) < 2:
+            st.warning("⚠️ 请至少选择2个工况进行对比")
+        else:
+            def _calc_extra_metrics(cdata, net_ref=None):
+                rs = cdata["results_summary"]
+                node_res = cdata["node_results"]
+                pipe_res = cdata["pipe_results"]
+                temp_drops = [v["temperature_drop"] for v in pipe_res.values()]
+                max_temp_drop = max(temp_drops) if temp_drops else 0.0
+                end_user_pressures = []
+                if net_ref is not None:
+                    for n in net_ref.get_nodes_by_type(NODE_TYPE_END_USER):
+                        nr = node_res.get(str(n.id))
+                        if nr:
+                            end_user_pressures.append(nr["pressure"])
+                else:
+                    for k, v in node_res.items():
+                        end_user_pressures.append(v["pressure"])
+                min_end_pressure = min(end_user_pressures) if end_user_pressures else 0.0
+                return {
+                    "总供热量(MW)": rs["total_heat_supplied"] / 1e6,
+                    "热损失率(%)": rs["heat_loss_rate"],
+                    "泵耗电(kW)": rs["total_pump_power"],
+                    "供热单耗(kWh/GJ)": rs["specific_energy_consumption"],
+                    "最大温降(°C)": max_temp_drop,
+                    "最小末端压力(mH₂O)": min_end_pressure,
+                }
+
+            compare_data = {}
+            for cn in selected_conds:
+                compare_data[cn] = _calc_extra_metrics(
+                    st.session_state.saved_conditions[cn],
+                    st.session_state.network,
+                )
+
+            metric_names = list(list(compare_data.values())[0].keys())
+            st.markdown("##### 📋 关键指标对比表（每行高亮差异最大的值）")
+
+            def _highlight_row(row, metric):
+                vals = [row[cn] for cn in selected_conds]
+                vmin = min(vals)
+                vmax = max(vals)
+                if abs(vmax - vmin) < 1e-9:
+                    return ["" for _ in selected_conds]
+                if metric in ["热损失率(%)", "供热单耗(kWh/GJ)", "泵耗电(kW)", "最大温降(°C)"]:
+                    target = vmin
+                else:
+                    target = vmax
+                return [
+                    "background-color: #fff3a8; font-weight: bold; color: #b8860b"
+                    if abs(v - target) < 1e-9 else ""
+                    for v in vals
+                ]
+
+            table_data = []
+            for mn in metric_names:
+                row = {"指标": mn}
+                for cn in selected_conds:
+                    val = compare_data[cn][mn]
+                    if mn == "总供热量(MW)":
+                        row[cn] = f"{val:.2f}"
+                    elif mn == "热损失率(%)":
+                        row[cn] = f"{val:.2f}"
+                    elif mn == "泵耗电(kW)":
+                        row[cn] = f"{val:.1f}"
+                    elif mn == "供热单耗(kWh/GJ)":
+                        row[cn] = f"{val:.2f}"
+                    elif mn == "最大温降(°C)":
+                        row[cn] = f"{val:.3f}"
+                    elif mn == "最小末端压力(mH₂O)":
+                        row[cn] = f"{val:.3f}"
+                table_data.append(row)
+
+            df_compare = pd.DataFrame(table_data)
+            styled_rows = []
+            for mn in metric_names:
+                row = {"指标": mn}
+                for cn in selected_conds:
+                    row[cn] = compare_data[cn][mn]
+                styled_rows.append(row)
+            df_styled = pd.DataFrame(styled_rows)
+
+            def apply_style(x):
+                styles = pd.DataFrame("", index=x.index, columns=x.columns)
+                for idx, mn in enumerate(metric_names):
+                    row_vals = [compare_data[cn][mn] for cn in selected_conds]
+                    vmin = min(row_vals)
+                    vmax = max(row_vals)
+                    if abs(vmax - vmin) < 1e-9:
+                        continue
+                    if mn in ["热损失率(%)", "供热单耗(kWh/GJ)", "泵耗电(kW)", "最大温降(°C)"]:
+                        target = vmin
+                    else:
+                        target = vmax
+                    for ci, cn in enumerate(selected_conds):
+                        if abs(compare_data[cn][mn] - target) < 1e-9:
+                            styles.loc[idx, cn] = "background-color: #fff3a8; font-weight: bold; color: #b8860b"
+                return styles
+
+            styled_df = df_compare.style.apply(apply_style, axis=None)
+            st.dataframe(styled_df, use_container_width=True, hide_index=True)
+
+            st.divider()
+            col_rad, col_bar = st.columns(2)
+
+            with col_rad:
+                st.markdown("##### 🕸️ 雷达图：6维度归一化得分")
+                radar_fig = go.Figure()
+                norm_metrics = {}
+                for cn in selected_conds:
+                    norm_metrics[cn] = {}
+                for mn in metric_names:
+                    vals = [compare_data[cn][mn] for cn in selected_conds]
+                    vmin = min(vals)
+                    vmax = max(vals)
+                    for ci, cn in enumerate(selected_conds):
+                        if abs(vmax - vmin) < 1e-9:
+                            norm = 0.5
+                        else:
+                            if mn in ["热损失率(%)", "供热单耗(kWh/GJ)", "泵耗电(kW)", "最大温降(°C)"]:
+                                norm = 1.0 - (vals[ci] - vmin) / (vmax - vmin)
+                            else:
+                                norm = (vals[ci] - vmin) / (vmax - vmin)
+                        norm_metrics[cn][mn] = norm
+
+                colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
+                for ci, cn in enumerate(selected_conds):
+                    radar_fig.add_trace(go.Scatterpolar(
+                        r=[norm_metrics[cn][mn] for mn in metric_names],
+                        theta=metric_names,
+                        fill='toself',
+                        name=cn,
+                        line=dict(color=colors[ci % len(colors)], width=2),
+                        fillcolor=f"rgba{tuple(int(colors[ci%len(colors)][i:i+2],16) for i in (1,3,5))+(0.25,)}",
+                    ))
+                radar_fig.update_layout(
+                    polar=dict(
+                        radialaxis=dict(visible=True, range=[0, 1], tickvals=[0, 0.25, 0.5, 0.75, 1]),
+                    ),
+                    height=500,
+                    margin=dict(l=40, r=40, t=40, b=40),
+                    legend=dict(orientation="h", yanchor="bottom", y=-0.1, xanchor="center", x=0.5),
+                )
+                st.plotly_chart(radar_fig, use_container_width=True)
+
+            with col_bar:
+                st.markdown("##### 📊 柱状图：各热源出力分配对比")
+                all_source_ids = set()
+                for cn in selected_conds:
+                    sr = st.session_state.saved_conditions[cn].get("source_ratios", {})
+                    all_source_ids.update(sr.keys())
+                source_ids = sorted(all_source_ids, key=lambda x: int(x) if str(x).isdigit() else str(x))
+                if source_ids:
+                    bar_fig = go.Figure()
+                    source_names = {}
+                    if st.session_state.network:
+                        for sid in source_ids:
+                            try:
+                                sid_int = int(sid) if isinstance(sid, str) else sid
+                                if sid_int in st.session_state.network.nodes:
+                                    source_names[sid] = st.session_state.network.nodes[sid_int].name
+                            except (ValueError, TypeError):
+                                source_names[sid] = f"热源{sid}"
+                    else:
+                        for sid in source_ids:
+                            source_names[sid] = f"热源{sid}"
+                    for ci, cn in enumerate(selected_conds):
+                        sr = st.session_state.saved_conditions[cn].get("source_ratios", {})
+                        ratios = [sr.get(str(sid), sr.get(int(sid), 0.0)) * 100 for sid in source_ids]
+                        bar_fig.add_trace(go.Bar(
+                            name=cn,
+                            x=[source_names.get(sid, f"热源{sid}") for sid in source_ids],
+                            y=ratios,
+                            text=[f"{r:.1f}%" for r in ratios],
+                            textposition='auto',
+                            marker_color=colors[ci % len(colors)],
+                        ))
+                    bar_fig.update_layout(
+                        barmode='group',
+                        yaxis=dict(title="负荷分配比例 (%)", range=[0, 100]),
+                        height=500,
+                        margin=dict(l=40, r=40, t=40, b=60),
+                        legend=dict(orientation="h", yanchor="bottom", y=-0.15, xanchor="center", x=0.5),
+                    )
+                    st.plotly_chart(bar_fig, use_container_width=True)
+                else:
+                    st.info("所选工况中暂无热源分配数据")
+
+            st.divider()
+            with st.expander("📝 各工况输入参数详细对比"):
+                param_rows = []
+                param_list = [
+                    ("环境温度(°C)", "environment_temperature", "°C", lambda x: f"{x:.1f}"),
+                    ("水比热容(J/kg·°C)", "water_specific_heat", "", lambda x: f"{x:.0f}"),
+                    ("调度策略", "dispatch_strategy", "", lambda x: x.split("（")[0]),
+                    ("水力平衡容差(%)", "balance_tolerance", "%", lambda x: f"{x*100:.0f}"),
+                ]
+                for pname, pkey, punit, pfmt in param_list:
+                    row = {"参数": pname}
+                    for cn in selected_conds:
+                        val = st.session_state.saved_conditions[cn]["input_params"].get(pkey, "-")
+                        row[cn] = pfmt(val) if val != "-" else "-"
+                    param_rows.append(row)
+                n_sources_row = {"参数": "热源供水温度配置"}
+                for cn in selected_conds:
+                    sts = st.session_state.saved_conditions[cn]["input_params"]["source_temps"]
+                    n_sources_row[cn] = f"{len(sts)}个热源"
+                param_rows.append(n_sources_row)
+                for si, (sid, _) in enumerate(st.session_state.source_temps.items()):
+                    if st.session_state.network:
+                        try:
+                            sid_int = int(sid) if isinstance(sid, str) else sid
+                            sname = st.session_state.network.nodes[sid_int].name if sid_int in st.session_state.network.nodes else f"热源{sid}"
+                        except (ValueError, TypeError):
+                            sname = f"热源{sid}"
+                    else:
+                        sname = f"热源{sid}"
+                    row = {"参数": f"  {sname}供水温度(°C)"}
+                    for cn in selected_conds:
+                        sts = st.session_state.saved_conditions[cn]["input_params"]["source_temps"]
+                        sv = sts.get(str(sid), sts.get(int(sid), "-"))
+                        row[cn] = f"{sv:.1f}" if sv != "-" else "-"
+                    param_rows.append(row)
+                st.dataframe(pd.DataFrame(param_rows), use_container_width=True, hide_index=True)
+
+with tabs[7]:
     st.subheader("📝 管网数据编辑")
     net = st.session_state.network
     if net is None:
@@ -713,7 +1102,7 @@ with tabs[6]:
                 t = st.slider(f"{sn.name} 供水温度 (°C)", 60.0, 150.0, float(default_t), 1.0, key=f"src_t_{sn.id}")
                 st.session_state.source_temps[sn.id] = t
 
-with tabs[7]:
+with tabs[8]:
     st.subheader("📄 供热运行分析报告导出")
     if st.session_state.results is None:
         st.info("请先运行计算后再导出报告")
