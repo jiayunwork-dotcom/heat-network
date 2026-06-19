@@ -82,11 +82,16 @@ def get_wall_thickness(material: str, diameter: float) -> float:
 
 
 def get_water_properties(temperature_c: float) -> Tuple[float, float]:
-    t = temperature_c
-    density = 999.83952 + 16.945176 * t - 7.9870401e-3 * t ** 2 \
-        - 46.170461e-6 * t ** 3 + 105.56302e-9 * t ** 4 - 280.54253e-12 * t ** 5
+    t = max(0.0, min(200.0, temperature_c))
+    a1 = 999.83952
+    a2 = 16.945176e-3
+    a3 = -7.9870401e-6
+    a4 = -46.170461e-9
+    a5 = 105.56302e-12
+    a6 = -280.54253e-15
+    density = a1 + a2 * t + a3 * t ** 2 + a4 * t ** 3 + a5 * t ** 4 + a6 * t ** 5
     density = density / (1.0 + 16.879850e-6 * t)
-    a = 0.00002414
+    a = 2.414e-5
     b = 247.8
     c = 140.0
     viscosity = a * 10 ** (b / (t + c))

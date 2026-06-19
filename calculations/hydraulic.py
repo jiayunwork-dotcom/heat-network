@@ -36,8 +36,8 @@ def compute_pipe_hydraulics(
         return 0.0, 0.0, 0.02, 0.0, 0.0
     density, viscosity = get_water_properties(temperature)
     area = np.pi * (pipe.diameter / 2.0) ** 2
-    velocity = flow_rate / area / density
-    reynolds = abs(velocity) * pipe.diameter / max(viscosity, 1e-7)
+    velocity = abs(flow_rate) / area
+    reynolds = velocity * pipe.diameter / max(viscosity, 1e-7)
     roughness = get_pipe_roughness(pipe.material, pipe.pipe_age)
     f = solve_colebrook_white(reynolds, roughness, pipe.diameter)
     g = 9.81
@@ -64,12 +64,22 @@ def compute_pump_head(pipe: Pipe, flow_rate: float) -> float:
     if pipe.pump_efficiency_curve and len(pipe.pump_efficiency_curve) >= 2:
         q_points = np.array([p[0] for p in pipe.pump_efficiency_curve])
         h_points = np.array([p[1] for p in pipe.pump_efficiency_curve])
-        if q_abs >= q_points[-1]:
-            return 0.0
-        head = np.interp(q_abs, q_points, h_points)
+        if q_abs <= q_points[0]:
+            head = h_points[0]
+        elif q_abs <= q_points[-1]:
+            head = np.interp(q_abs, q_points, h_points)
+        else:
+            if len(q_points) >= 2:
+                dq = q_points[-1] - q_points[-2]
+                dh = h_points[-1] - h_points[-2]
+                slope = dh / max(dq, 1e-6)
+                head = h_points[-1] + slope * (q_abs - q_points[-1])
+                head = max(head, 0.0)
+            else:
+                head = max(h_points[-1] * (1.0 - (q_abs - q_points[-1]) / max(q_points[-1], 1e-6)), 0.0)
     else:
-        q_max = max(pipe.rated_head / 25.0, 0.1)
-        q_ratio = min(q_abs / q_max, 1.0)
+        q_max = max(pipe.rated_head / 20.0, 0.2)
+        q_ratio = min(q_abs / q_max, 1.5)
         head = pipe.rated_head * max(0, 1.0 - q_ratio ** 2)
     return head if flow_rate >= 0 else -head
 

@@ -62,6 +62,8 @@ def compute_pipe_temperature_drop(
 def _topological_sort(network: PipeNetwork) -> List[int]:
     in_degree = {nid: 0 for nid in network.nodes}
     for pipe in network.pipes.values():
+        if "回水" in pipe.name or "return" in pipe.name.lower():
+            continue
         if pipe.start_node_id in in_degree and pipe.end_node_id in in_degree:
             in_degree[pipe.end_node_id] += 1
     source_ids = [n.id for n in network.get_nodes_by_type(NODE_TYPE_SOURCE)]
@@ -78,6 +80,8 @@ def _topological_sort(network: PipeNetwork) -> List[int]:
         nid = queue.popleft()
         result.append(nid)
         for pipe in network.get_downstream_pipes(nid):
+            if "回水" in pipe.name or "return" in pipe.name.lower():
+                continue
             child = pipe.end_node_id
             if child in in_degree:
                 in_degree[child] -= 1
@@ -119,6 +123,8 @@ def solve_thermal(
             total_mass_flow = 0.0
             weighted_temp = 0.0
             for ip in incoming:
+                if "回水" in ip.name or "return" in ip.name.lower():
+                    continue
                 flow = flow_rates.get(ip.id, 0.0)
                 if flow > 0 and ip.id in pipe_results:
                     density, _ = get_water_properties(pipe_results[ip.id].outlet_temperature if pipe_results[ip.id].outlet_temperature > 0 else 80.0)
@@ -132,6 +138,8 @@ def solve_thermal(
                 node_temps[nid] = env_t + 20.0
         downstream = network.get_downstream_pipes(nid)
         for dp in downstream:
+            if "回水" in dp.name or "return" in dp.name.lower():
+                continue
             flow = flow_rates.get(dp.id, 0.0)
             if flow > 1e-10:
                 inlet_t = node_temps[nid]

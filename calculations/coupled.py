@@ -109,20 +109,22 @@ def solve_coupled(
                     nr.flow_in += pr.flow_rate
         results.node_results[nid] = nr
     total_heat_supplied = 0.0
+    DESIGN_SUPPLY_RETURN_DELTA_T = 30.0
     for sn in source_nodes:
         for dp in network.get_downstream_pipes(sn.id):
+            if "回水" in dp.name or "return" in dp.name.lower():
+                continue
             pr = results.pipe_results.get(dp.id)
             if pr and pr.flow_rate > 0:
                 density, _ = get_water_properties(pr.inlet_temperature)
                 mass_flow = pr.flow_rate * density
-                t_diff = pr.inlet_temperature - network.environment_temperature
-                total_heat_supplied += mass_flow * cp_water * t_diff
+                total_heat_supplied += mass_flow * cp_water * DESIGN_SUPPLY_RETURN_DELTA_T
     total_heat_loss = sum(pr.heat_loss for pr in results.pipe_results.values())
     results.total_heat_supplied = total_heat_supplied
     results.total_heat_loss = total_heat_loss
     results.heat_loss_rate = total_heat_loss / max(total_heat_supplied, 1e-6) * 100.0
     results.total_pump_power = sum(pr.power_consumption for pr in results.pipe_results.values())
-    heat_delivered_gj = max(total_heat_supplied - total_heat_loss, 0) / 1.0e9
+    heat_delivered_gj = max(total_heat_supplied, 0) / 1.0e9
     results.specific_energy_consumption = (results.total_pump_power * 3600.0 / 3.6e6) / max(heat_delivered_gj, 1e-6) if heat_delivered_gj > 0 else 0.0
     return results
 
