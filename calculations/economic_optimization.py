@@ -1,5 +1,7 @@
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, field
+from collections import deque
+import numpy as np
 
 from models import (
     PipeNetwork, Pipe, NetworkResults, PipeSectionResult,
@@ -7,7 +9,7 @@ from models import (
     INSULATION_MATERIAL_ROCK_WOOL, INSULATION_MATERIAL_GLASS_WOOL,
     INSULATION_CONDUCTIVITY, PIPE_WALL_CONDUCTIVITY,
     INNER_CONVECTION_COEFFICIENT, OUTER_SOIL_CONDUCTIVITY,
-    get_wall_thickness,
+    get_wall_thickness, NODE_TYPE_END_USER, NODE_TYPE_SOURCE,
 )
 from calculations.thermal import compute_overall_heat_transfer_coefficient
 
@@ -83,6 +85,41 @@ class ComprehensiveRetrofitItem:
     annual_saving: float
     payback_period: float
     detail: str = ""
+    criticality: float = 0.0
+    composite_score: float = 0.0
+    pipe_id: Optional[int] = None
+
+
+@dataclass
+class PhasePlanItem:
+    year: int
+    items: List[ComprehensiveRetrofitItem]
+    annual_investment: float
+    annual_saving: float
+    cumulative_saving: float
+
+
+@dataclass
+class SensitivityPoint:
+    parameter_multiplier: float
+    parameter_value: float
+    total_annual_saving: float
+    overall_payback_period: float
+
+
+@dataclass
+class SensitivityAnalysisResult:
+    parameter_name: str
+    base_value: float
+    points: List[SensitivityPoint]
+
+
+@dataclass
+class CashFlowPoint:
+    year: int
+    investment: float
+    saving: float
+    cumulative_cash_flow: float
 
 
 @dataclass
@@ -94,6 +131,12 @@ class EconomicOptimizationResult:
     total_investment: float = 0.0
     total_annual_saving: float = 0.0
     overall_payback_period: float = 0.0
+    pipe_criticality: Dict[int, float] = field(default_factory=dict)
+    phase_plan: List[PhasePlanItem] = field(default_factory=list)
+    electricity_sensitivity: Optional[SensitivityAnalysisResult] = None
+    gas_sensitivity: Optional[SensitivityAnalysisResult] = None
+    cash_flow: List[CashFlowPoint] = field(default_factory=list)
+    payback_year: Optional[int] = None
 
 
 def calculate_operating_cost(
@@ -319,9 +362,51 @@ def analyze_pump_efficiency(
     return retrofits
 
 
+def calculate_pipe_criticality(
+    network: PipeNetwork,
+    results: NetworkResults,
+) -> Dict[int, float]:
+    total_supply_flow = 0.0
+    for pr in results.pipe_results.values():
+        total_supply_flow += abs(pr.flow_rate)
+
+    pipe_criticality = {}
+
+    for pid, pipe in network.pipes.items():
+        pr = results.pipe_results.get(pid)
+        if pr is None or abs(pr.flow_rate) < 1e-6:
+            pipe_criticality[pid] = 0.0
+            continue
+
+        downstream_user_count = 0
+        visited = set()
+        queue = deque()
+        queue.append(pipe.end_node_id)
+        visited.add(pipe.end_node_id)
+
+        while queue:
+            node_id = queue.popleft()
+            node = network.nodes.get(node_id)
+            if node is None:
+                continue
+            if node.type == NODE_TYPE_END_USER:
+                downstream_user_count += 1
+            for dp in network.get_downstream_pipes(node_id):
+                if dp.end_node_id not in visited:
+                    visited.add(dp.end_node_id)
+                    queue.append(dp.end_node_id)
+
+        flow_ratio = abs(pr.flow_rate) / max(total_supply_flow, 1e-6)
+        criticality = downstream_user_count * flow_ratio
+        pipe_criticality[pid] = criticality
+
+    return pipe_criticality
+
+
 def generate_comprehensive_retrofit_list(
     insulation_retrofits: List[PipeInsulationRetrofit],
     pump_retrofits: List[PumpEfficiencyRetrofit],
+    pipe_criticality: Dict[int, float],
     payback_threshold: float = DEFAULT_PAYBACK_THRESHOLD,
 ) -> Tuple[List[ComprehensiveRetrofitItem], float, float, float]:
     items = []
@@ -329,6 +414,8 @@ def generate_comprehensive_retrofit_list(
     for ir in insulation_retrofits:
         if ir.payback_period > payback_threshold:
             continue
+        criticality = pipe_criticality.get(ir.pipe_id, 0.0)
+        composite_score = (1.0 / max(ir.payback_period, 0.01)) * criticality if criticality > 0 else (1.0 / max(ir.payback_period, 0.01))
         items.append(ComprehensiveRetrofitItem(
             item_id=f"insulation_{ir.pipe_id}",
             item_name=ir.pipe_name,
@@ -337,6 +424,9 @@ def generate_comprehensive_retrofit_list(
             annual_saving=ir.annual_gas_saving,
             payback_period=ir.payback_period,
             detail=f"保温层厚度 {ir.original_thickness*1000:.0f}mm → {ir.new_thickness*1000:.0f}mm，年节气 {ir.heat_loss_saving/1000:.2f} kW",
+            criticality=criticality,
+            composite_score=composite_score,
+            pipe_id=ir.pipe_id,
         ))
 
     for pr in pump_retrofits:
@@ -344,6 +434,8 @@ def generate_comprehensive_retrofit_list(
             continue
         if pr.vfd_payback_period > payback_threshold:
             continue
+        criticality = pipe_criticality.get(pr.pipe_id, 0.0)
+        composite_score = (1.0 / max(pr.vfd_payback_period, 0.01)) * criticality if criticality > 0 else (1.0 / max(pr.vfd_payback_period, 0.01))
         items.append(ComprehensiveRetrofitItem(
             item_id=f"pump_{pr.pipe_id}",
             item_name=pr.pipe_name + " 变频改造",
@@ -352,15 +444,196 @@ def generate_comprehensive_retrofit_list(
             annual_saving=pr.vfd_annual_saving,
             payback_period=pr.vfd_payback_period,
             detail=f"额定扬程 {pr.rated_head:.1f}m，实际 {pr.actual_head:.1f}m，{pr.status}",
+            criticality=criticality,
+            composite_score=composite_score,
+            pipe_id=pr.pipe_id,
         ))
 
-    items.sort(key=lambda x: x.payback_period)
+    items.sort(key=lambda x: -x.composite_score)
 
     total_investment = sum(item.investment for item in items)
     total_annual_saving = sum(item.annual_saving for item in items)
     overall_payback = total_investment / total_annual_saving if total_annual_saving > 0 else float('inf')
 
     return items, total_investment, total_annual_saving, overall_payback
+
+
+def generate_phase_plan(
+    retrofit_items: List[ComprehensiveRetrofitItem],
+    annual_budget: float = 500000.0,
+    max_years: int = 5,
+) -> List[PhasePlanItem]:
+    if not retrofit_items:
+        return []
+
+    sorted_items = sorted(retrofit_items, key=lambda x: x.payback_period)
+
+    phase_plan = []
+    remaining_items = sorted_items[:]
+    cumulative_saving = 0.0
+    year = 1
+
+    while remaining_items and year <= max_years:
+        year_items = []
+        year_investment = 0.0
+        year_saving = 0.0
+
+        i = 0
+        while i < len(remaining_items):
+            item = remaining_items[i]
+            if item.investment > annual_budget:
+                if not year_items and year_investment == 0.0:
+                    year_items.append(item)
+                    year_investment += item.investment
+                    year_saving += item.annual_saving
+                    remaining_items.pop(i)
+                    continue
+                else:
+                    i += 1
+                    continue
+
+            if year_investment + item.investment <= annual_budget:
+                year_items.append(item)
+                year_investment += item.investment
+                year_saving += item.annual_saving
+                remaining_items.pop(i)
+            else:
+                i += 1
+
+        if year_items:
+            cumulative_saving += year_saving
+            phase_plan.append(PhasePlanItem(
+                year=year,
+                items=year_items,
+                annual_investment=year_investment,
+                annual_saving=year_saving,
+                cumulative_saving=cumulative_saving,
+            ))
+            year += 1
+        else:
+            break
+
+    if remaining_items and year <= max_years:
+        for item in remaining_items:
+            if year > max_years:
+                break
+            cumulative_saving += item.annual_saving
+            phase_plan.append(PhasePlanItem(
+                year=year,
+                items=[item],
+                annual_investment=item.investment,
+                annual_saving=item.annual_saving,
+                cumulative_saving=cumulative_saving,
+            ))
+            year += 1
+
+    return phase_plan
+
+
+def perform_sensitivity_analysis(
+    network: PipeNetwork,
+    results: NetworkResults,
+    base_electricity_price: float,
+    base_gas_price: float,
+    gas_calorific_value: float,
+    boiler_efficiency: float,
+    payback_threshold: float,
+    pipe_criticality: Dict[int, float],
+    parameter_name: str,
+    num_points: int = 5,
+) -> SensitivityAnalysisResult:
+    if parameter_name == "electricity":
+        base_value = base_electricity_price
+    elif parameter_name == "gas":
+        base_value = base_gas_price
+    else:
+        raise ValueError(f"Unknown parameter: {parameter_name}")
+
+    multipliers = np.linspace(0.5, 2.0, num_points)
+    points = []
+
+    for mult in multipliers:
+        if parameter_name == "electricity":
+            elec_price = base_electricity_price * mult
+            gas_price_val = base_gas_price
+        else:
+            elec_price = base_electricity_price
+            gas_price_val = base_gas_price * mult
+
+        ins_retrofits = analyze_insulation_retrofit(
+            network, results,
+            gas_price=gas_price_val,
+            gas_calorific_value=gas_calorific_value,
+            boiler_efficiency=boiler_efficiency,
+            payback_threshold=payback_threshold,
+            cp_water=network.water_specific_heat,
+        )
+
+        pump_retrofits = analyze_pump_efficiency(
+            network, results,
+            electricity_price=elec_price,
+        )
+
+        items, total_inv, total_saving, overall_payback = generate_comprehensive_retrofit_list(
+            ins_retrofits, pump_retrofits, pipe_criticality, payback_threshold
+        )
+
+        points.append(SensitivityPoint(
+            parameter_multiplier=mult,
+            parameter_value=base_value * mult,
+            total_annual_saving=total_saving,
+            overall_payback_period=overall_payback,
+        ))
+
+    return SensitivityAnalysisResult(
+        parameter_name=parameter_name,
+        base_value=base_value,
+        points=points,
+    )
+
+
+def calculate_cash_flow(
+    phase_plan: List[PhasePlanItem],
+) -> Tuple[List[CashFlowPoint], Optional[int]]:
+    if not phase_plan:
+        return [], None
+
+    max_year = max(item.year for item in phase_plan)
+    cash_flow = []
+
+    cumulative = 0.0
+    payback_year = None
+
+    for year in range(0, max_year + 1):
+        year_investment = 0.0
+        year_saving = 0.0
+
+        if year == 0:
+            if phase_plan and phase_plan[0].year == 1:
+                year_investment = phase_plan[0].annual_investment
+            cumulative = -year_investment
+        else:
+            for phase in phase_plan:
+                if phase.year <= year:
+                    year_saving += phase.annual_saving
+            if year + 1 <= max_year:
+                for phase in phase_plan:
+                    if phase.year == year + 1:
+                        year_investment = phase.annual_investment
+                        break
+            cumulative = cumulative + year_saving - year_investment
+
+        if payback_year is None and cumulative >= 0 and year > 0:
+            payback_year = year
+
+        cash_flow.append(CashFlowPoint(
+            year=year,
+            investment=year_investment,
+            saving=year_saving,
+            cumulative_cash_flow=cumulative,
+        ))
+
+    return cash_flow, payback_year
 
 
 def run_economic_optimization(
@@ -373,6 +646,8 @@ def run_economic_optimization(
     payback_threshold: float = DEFAULT_PAYBACK_THRESHOLD,
     daily_hours: float = DEFAULT_DAILY_HOURS,
     annual_hours_pump: float = DEFAULT_ANNUAL_HOURS,
+    annual_budget: float = 500000.0,
+    max_phase_years: int = 5,
 ) -> EconomicOptimizationResult:
     op_cost = calculate_operating_cost(
         network, results,
@@ -382,6 +657,8 @@ def run_economic_optimization(
         boiler_efficiency=boiler_efficiency,
         daily_hours=daily_hours,
     )
+
+    pipe_criticality = calculate_pipe_criticality(network, results)
 
     insulation_retrofits = analyze_insulation_retrofit(
         network, results,
@@ -400,8 +677,40 @@ def run_economic_optimization(
 
     comprehensive_list, total_investment, total_annual_saving, overall_payback = \
         generate_comprehensive_retrofit_list(
-            insulation_retrofits, pump_retrofits, payback_threshold
+            insulation_retrofits, pump_retrofits, pipe_criticality, payback_threshold
         )
+
+    phase_plan = generate_phase_plan(
+        comprehensive_list,
+        annual_budget=annual_budget,
+        max_years=max_phase_years,
+    )
+
+    electricity_sensitivity = perform_sensitivity_analysis(
+        network, results,
+        base_electricity_price=electricity_price,
+        base_gas_price=gas_price,
+        gas_calorific_value=gas_calorific_value,
+        boiler_efficiency=boiler_efficiency,
+        payback_threshold=payback_threshold,
+        pipe_criticality=pipe_criticality,
+        parameter_name="electricity",
+        num_points=5,
+    )
+
+    gas_sensitivity = perform_sensitivity_analysis(
+        network, results,
+        base_electricity_price=electricity_price,
+        base_gas_price=gas_price,
+        gas_calorific_value=gas_calorific_value,
+        boiler_efficiency=boiler_efficiency,
+        payback_threshold=payback_threshold,
+        pipe_criticality=pipe_criticality,
+        parameter_name="gas",
+        num_points=5,
+    )
+
+    cash_flow, payback_year = calculate_cash_flow(phase_plan)
 
     return EconomicOptimizationResult(
         operating_cost=op_cost,
@@ -411,4 +720,10 @@ def run_economic_optimization(
         total_investment=total_investment,
         total_annual_saving=total_annual_saving,
         overall_payback_period=overall_payback,
+        pipe_criticality=pipe_criticality,
+        phase_plan=phase_plan,
+        electricity_sensitivity=electricity_sensitivity,
+        gas_sensitivity=gas_sensitivity,
+        cash_flow=cash_flow,
+        payback_year=payback_year,
     )

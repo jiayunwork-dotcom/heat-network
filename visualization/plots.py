@@ -851,3 +851,178 @@ def create_retrofit_investment_bar_figure(
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     return fig
+
+
+def create_sensitivity_analysis_figure(
+    sensitivity_result,
+    parameter_display_name: str,
+    parameter_unit: str,
+) -> go.Figure:
+    if not sensitivity_result or not sensitivity_result.points:
+        return go.Figure().add_annotation(
+            text="暂无敏感性分析数据",
+            showarrow=False,
+            font=dict(size=16),
+        )
+
+    multipliers = [p.parameter_multiplier for p in sensitivity_result.points]
+    parameter_values = [p.parameter_value for p in sensitivity_result.points]
+    total_savings = [p.total_annual_saving for p in sensitivity_result.points]
+    payback_periods = [p.overall_payback_period if p.overall_payback_period != float('inf') else None for p in sensitivity_result.points]
+
+    x_labels = [f"{m:.1f}x\n({v:.2f}{unit})" for m, v, unit in zip(multipliers, parameter_values, [parameter_unit]*len(multipliers))]
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    fig.add_trace(
+        go.Scatter(
+            x=x_labels,
+            y=total_savings,
+            mode='lines+markers',
+            name='总年节省额 (元)',
+            line=dict(color='#4ecdc4', width=3),
+            marker=dict(size=10, symbol='circle'),
+            hovertemplate='<b>%{x}</b><br>总年节省额: %{y:,.0f} 元<extra></extra>',
+        ),
+        secondary_y=False,
+    )
+
+    valid_payback = []
+    valid_x = []
+    for x, pb in zip(x_labels, payback_periods):
+        if pb is not None:
+            valid_payback.append(pb)
+            valid_x.append(x)
+
+    fig.add_trace(
+        go.Scatter(
+            x=valid_x,
+            y=valid_payback,
+            mode='lines+markers',
+            name='整体回报期 (年)',
+            line=dict(color='#ff6b6b', width=3, dash='dash'),
+            marker=dict(size=10, symbol='square'),
+            hovertemplate='<b>%{x}</b><br>整体回报期: %{y:.2f} 年<extra></extra>',
+        ),
+        secondary_y=True,
+    )
+
+    base_mult = 1.0
+    base_idx = min(range(len(multipliers)), key=lambda i: abs(multipliers[i] - base_mult))
+    fig.add_vline(
+        x=base_idx,
+        line=dict(color='#ffa500', width=2, dash='dot'),
+        annotation=dict(
+            text=f"当前值 ({sensitivity_result.base_value:.2f} {parameter_unit})",
+            font=dict(color='#ffa500', size=11),
+            showarrow=True,
+            arrowhead=1,
+        )
+    )
+
+    fig.update_layout(
+        title=dict(text=f"{parameter_display_name}敏感性分析", x=0.5),
+        xaxis=dict(title=f"{parameter_display_name}变化倍率（括号内为实际价格）", showgrid=True),
+        height=500,
+        margin=dict(l=60, r=60, t=80, b=80),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+    )
+    fig.update_yaxes(title_text="总年节省额 (元)", secondary_y=False, color='#4ecdc4')
+    fig.update_yaxes(title_text="整体回报期 (年)", secondary_y=True, color='#ff6b6b')
+
+    return fig
+
+
+def create_cash_flow_figure(
+    cash_flow_data,
+    payback_year=None,
+) -> go.Figure:
+    if not cash_flow_data:
+        return go.Figure().add_annotation(
+            text="暂无现金流数据",
+            showarrow=False,
+            font=dict(size=16),
+        )
+
+    years = [cf.year for cf in cash_flow_data]
+    cumulative_cash = [cf.cumulative_cash_flow for cf in cash_flow_data]
+    investments = [cf.investment for cf in cash_flow_data]
+    savings = [cf.saving for cf in cash_flow_data]
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Scatter(
+            x=years,
+            y=cumulative_cash,
+            mode='lines+markers',
+            name='累计现金流',
+            line=dict(color='#45b7d1', width=4),
+            marker=dict(size=12, symbol='circle', line=dict(width=2, color='white')),
+            hovertemplate='<b>第%{x}年</b><br>累计现金流: %{y:,.0f} 元<extra></extra>',
+        )
+    )
+
+    fig.add_trace(
+        go.Bar(
+            x=years,
+            y=[-inv for inv in investments],
+            name='当年投资额',
+            marker_color='#ff6b6b',
+            opacity=0.6,
+            hovertemplate='<b>第%{x}年</b><br>投资额: %{customdata:,.0f} 元<extra></extra>',
+            customdata=investments,
+        )
+    )
+
+    fig.add_trace(
+        go.Bar(
+            x=years,
+            y=savings,
+            name='当年节省额',
+            marker_color='#4ecdc4',
+            opacity=0.6,
+            hovertemplate='<b>第%{x}年</b><br>节省额: %{y:,.0f} 元<extra></extra>',
+        )
+    )
+
+    fig.add_hline(
+        y=0,
+        line=dict(color='#333', width=2, dash='solid'),
+    )
+
+    if payback_year is not None:
+        payback_idx = years.index(payback_year) if payback_year in years else len(years) - 1
+        payback_value = cumulative_cash[payback_idx] if payback_idx < len(cumulative_cash) else 0
+
+        fig.add_vline(
+            x=payback_year,
+            line=dict(color='#ffa500', width=3, dash='dash'),
+        )
+        fig.add_annotation(
+            x=payback_year,
+            y=payback_value,
+            text=f"🏆 投资回收期<br>第 {payback_year} 年",
+            showarrow=True,
+            arrowhead=2,
+            arrowsize=1.5,
+            arrowcolor='#ffa500',
+            font=dict(color='#ffa500', size=13, weight='bold'),
+            bgcolor='rgba(255,255,255,0.9)',
+            bordercolor='#ffa500',
+            borderwidth=2,
+            ax=80,
+            ay=-60,
+        )
+
+    fig.update_layout(
+        title=dict(text="分期改造累计现金流分析", x=0.5),
+        xaxis=dict(title="年份", showgrid=True, tickmode='linear', dtick=1),
+        yaxis=dict(title="累计现金流 (元)", showgrid=True),
+        barmode='relative',
+        height=550,
+        margin=dict(l=60, r=40, t=80, b=50),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+
+    return fig

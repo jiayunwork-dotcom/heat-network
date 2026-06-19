@@ -8,6 +8,8 @@ from visualization.plots import (
     create_fault_topology_figure,
     create_operating_cost_pie_figure,
     create_retrofit_investment_bar_figure,
+    create_sensitivity_analysis_figure,
+    create_cash_flow_figure,
 )
 
 __all__ = [
@@ -20,4 +22,6 @@ __all__ = [
     "create_fault_topology_figure",
     "create_operating_cost_pie_figure",
     "create_retrofit_investment_bar_figure",
+    "create_sensitivity_analysis_figure",
+    "create_cash_flow_figure",
 ]

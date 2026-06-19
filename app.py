@@ -44,6 +44,8 @@ from visualization import (
     create_fault_topology_figure,
     create_operating_cost_pie_figure,
     create_retrofit_investment_bar_figure,
+    create_sensitivity_analysis_figure,
+    create_cash_flow_figure,
 )
 from report import generate_pdf_report
 
@@ -132,6 +134,8 @@ def init_session():
         st.session_state.boiler_efficiency = DEFAULT_BOILER_EFFICIENCY
     if "payback_threshold" not in st.session_state:
         st.session_state.payback_threshold = DEFAULT_PAYBACK_THRESHOLD
+    if "annual_budget" not in st.session_state:
+        st.session_state.annual_budget = 50.0
 
 
 init_session()
@@ -360,6 +364,7 @@ if run_btn and st.session_state.network is not None:
                     gas_calorific_value=st.session_state.gas_calorific_value,
                     boiler_efficiency=st.session_state.boiler_efficiency,
                     payback_threshold=st.session_state.payback_threshold,
+                    annual_budget=st.session_state.annual_budget * 10000,
                 )
                 st.session_state.economic_results = eco_results
             except Exception as eco_e:
@@ -764,7 +769,7 @@ with tabs[6]:
         eco: EconomicOptimizationResult = st.session_state.economic_results
 
         with st.expander("⚙️ 经济参数设置", expanded=False):
-            col_p1, col_p2, col_p3 = st.columns(3)
+            col_p1, col_p2, col_p3, col_p4 = st.columns(4)
             with col_p1:
                 st.session_state.electricity_price = st.number_input(
                     "电价 (元/kWh)",
@@ -798,6 +803,14 @@ with tabs[6]:
                     value=st.session_state.payback_threshold,
                     step=0.5,
                 )
+                st.session_state.annual_budget = st.number_input(
+                    "年度改造预算 (万元/年)",
+                    min_value=10.0, max_value=500.0,
+                    value=st.session_state.annual_budget,
+                    step=5.0,
+                )
+            with col_p4:
+                st.info("💡 **分期改造说明**：\n\n- 系统按贪心策略分配改造项目\n- 每年优先选回报期最短的项目\n- 单项投资超预算时顺延单独安排\n- 生成3-5年分期计划表")
             if st.button("🔄 重新计算经济优化", use_container_width=True):
                 try:
                     eco_new = run_economic_optimization(
@@ -807,6 +820,7 @@ with tabs[6]:
                         gas_calorific_value=st.session_state.gas_calorific_value,
                         boiler_efficiency=st.session_state.boiler_efficiency,
                         payback_threshold=st.session_state.payback_threshold,
+                        annual_budget=st.session_state.annual_budget * 10000,
                     )
                     st.session_state.economic_results = eco_new
                     st.success("✅ 经济优化计算完成")
@@ -865,7 +879,7 @@ with tabs[6]:
                 st.table(pd.DataFrame(cost_detail_rows, columns=["项目", "金额", "占比"]))
 
             with col_right:
-                st.markdown("###### 📋 综合改造推荐列表（按投资回报期排序）")
+                st.markdown("###### 📋 综合改造推荐列表（按综合得分排序：1/回报期 × 关键度）")
                 if not eco.comprehensive_list:
                     st.info(f"💡 暂无回报期低于 {st.session_state.payback_threshold} 年的改造项目")
                 else:
@@ -878,6 +892,8 @@ with tabs[6]:
                             "投资额(元)": f"{item.investment:,.0f}",
                             "年节省(元)": f"{item.annual_saving:,.0f}",
                             "回报期(年)": f"{item.payback_period:.2f}",
+                            "关键度": f"{item.criticality:.3f}",
+                            "综合得分": f"{item.composite_score:.3f}",
                         })
                     df_retro = pd.DataFrame(retro_rows)
                     st.dataframe(df_retro, use_container_width=True, hide_index=True, height=320)
@@ -900,6 +916,83 @@ with tabs[6]:
                 st.markdown("###### 📊 改造项目投资额 vs 年节省额对比")
                 fig_bar = create_retrofit_investment_bar_figure(eco.comprehensive_list)
                 st.plotly_chart(fig_bar, use_container_width=True)
+
+            st.divider()
+
+            st.markdown("##### 📅 分期改造规划（按年度预算分配）")
+            if not eco.phase_plan:
+                st.info("💡 暂无改造项目，无法生成分期计划")
+            else:
+                phase_rows = []
+                for phase in eco.phase_plan:
+                    item_names = "、".join([item.item_name for item in phase.items])
+                    phase_rows.append({
+                        "年度": f"第{phase.year}年",
+                        "改造项目列表": item_names,
+                        "当年投资额(元)": f"{phase.annual_investment:,.0f}",
+                        "当年预计节省(元)": f"{phase.annual_saving:,.0f}",
+                        "累计节省(元)": f"{phase.cumulative_saving:,.0f}",
+                    })
+                df_phase = pd.DataFrame(phase_rows)
+                st.dataframe(df_phase, use_container_width=True, hide_index=True)
+
+                col_phase1, col_phase2, col_phase3 = st.columns(3)
+                with col_phase1:
+                    total_phase_inv = sum(p.annual_investment for p in eco.phase_plan)
+                    st.metric("分期总投资额", f"{total_phase_inv:,.0f} 元")
+                with col_phase2:
+                    total_phase_saving = sum(p.annual_saving for p in eco.phase_plan)
+                    st.metric("分期总年节省", f"{total_phase_saving:,.0f} 元")
+                with col_phase3:
+                    num_years = len(eco.phase_plan)
+                    st.metric("规划周期", f"{num_years} 年")
+
+            st.divider()
+
+            st.markdown("##### 📈 敏感性分析")
+            col_sens1, col_sens2 = st.columns(2)
+            with col_sens1:
+                st.markdown("###### 电价敏感性分析")
+                if eco.electricity_sensitivity:
+                    fig_elec_sens = create_sensitivity_analysis_figure(
+                        eco.electricity_sensitivity,
+                        "电价",
+                        "元/kWh"
+                    )
+                    st.plotly_chart(fig_elec_sens, use_container_width=True)
+                else:
+                    st.info("暂无电价敏感性分析数据")
+            with col_sens2:
+                st.markdown("###### 天然气价格敏感性分析")
+                if eco.gas_sensitivity:
+                    fig_gas_sens = create_sensitivity_analysis_figure(
+                        eco.gas_sensitivity,
+                        "天然气价格",
+                        "元/m³"
+                    )
+                    st.plotly_chart(fig_gas_sens, use_container_width=True)
+                else:
+                    st.info("暂无天然气价格敏感性分析数据")
+
+            st.divider()
+
+            st.markdown("##### 💰 现金流分析")
+            if not eco.cash_flow:
+                st.info("💡 暂无现金流数据")
+            else:
+                fig_cash = create_cash_flow_figure(eco.cash_flow, eco.payback_year)
+                st.plotly_chart(fig_cash, use_container_width=True)
+
+                cf_rows = []
+                for cf in eco.cash_flow:
+                    cf_rows.append({
+                        "年份": f"第{cf.year}年",
+                        "当年投资(元)": f"{cf.investment:,.0f}",
+                        "当年节省(元)": f"{cf.saving:,.0f}",
+                        "累计现金流(元)": f"{cf.cumulative_cash_flow:,.0f}",
+                    })
+                with st.expander("📋 现金流明细", expanded=False):
+                    st.dataframe(pd.DataFrame(cf_rows), use_container_width=True, hide_index=True)
 
             st.divider()
             tab_insulation, tab_pump = st.tabs(["🔧 保温改造详细分析", "⛽ 泵站能效优化分析"])
