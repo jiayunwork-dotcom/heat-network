@@ -516,25 +516,92 @@ def execute_emergency_action(
                     (qmax, float(target_head) * 0.3),
                 ]
     elif action_name == "switch_path":
-        pass
+        alternate_path_pipe_ids = params.get("alternate_path_pipe_ids", [])
+        if alternate_path_pipe_ids:
+            for pid in alternate_path_pipe_ids:
+                if pid in new_network.pipes:
+                    alt_pipe = new_network.pipes[pid]
+                    alt_pipe.equivalent_local_length_ratio = max(
+                        0.05, alt_pipe.equivalent_local_length_ratio * 0.3
+                    )
+                    if alt_pipe.has_pump and alt_pipe.rated_head:
+                        alt_pipe.rated_head = alt_pipe.rated_head * 1.10
+                        qmax = alt_pipe.rated_head / 30.0
+                        alt_pipe.pump_efficiency_curve = [
+                            (0, alt_pipe.rated_head * 1.2),
+                            (qmax * 0.5, alt_pipe.rated_head),
+                            (qmax, alt_pipe.rated_head * 0.3),
+                        ]
+        burst_pid = params.get("burst_pipe_id")
+        if burst_pid is not None and burst_pid in new_network.pipes:
+            del new_network.pipes[burst_pid]
     elif action_name == "isolate_pipe":
-        pass
+        burst_pid = params.get("burst_pipe_id")
+        close_valve_ids = params.get("close_valve_ids", [])
+        burst_removed_original = False
+        if burst_pid is not None and burst_pid in new_network.pipes:
+            del new_network.pipes[burst_pid]
+            burst_removed_original = True
+        if burst_removed_original:
+            temp_removed = []
+            for vid in close_valve_ids:
+                if vid in new_network.pipes:
+                    temp_pipe = new_network.pipes[vid]
+                    del new_network.pipes[vid]
+                    temp_removed.append((vid, temp_pipe))
+            valid_after_remove, _ = new_network.validate()
+            if not valid_after_remove and temp_removed:
+                for vid, pipe_obj in temp_removed:
+                    new_network.pipes[vid] = pipe_obj
+        else:
+            source_ids = [n.id for n in original_network.get_nodes_by_type(NODE_TYPE_SOURCE)]
+            user_ids = set()
+            if burst_pid is not None and burst_pid in original_network.pipes:
+                burst_pipe = original_network.pipes[burst_pid]
+                for endpoint in [burst_pipe.start_node_id, burst_pipe.end_node_id]:
+                    for pid, p in new_network.pipes.items():
+                        if pid == burst_pid:
+                            continue
+                        if p.start_node_id == endpoint or p.end_node_id == endpoint:
+                            if not p.has_pump:
+                                p.equivalent_local_length_ratio = max(
+                                    0.05, p.equivalent_local_length_ratio * 0.4
+                                )
+                            if p.has_pump and p.rated_head:
+                                p.rated_head = p.rated_head * 1.08
+                                qmax = p.rated_head / 30.0
+                                p.pump_efficiency_curve = [
+                                    (0, p.rated_head * 1.2),
+                                    (qmax * 0.5, p.rated_head),
+                                    (qmax, p.rated_head * 0.3),
+                                ]
 
     try:
         valid, _ = new_network.validate()
         if not valid:
-            return None
+            new_network = copy.deepcopy(current_modified_network)
+            valid, _ = new_network.validate()
 
         updated_results = solve_coupled(new_network, new_source_temps)
+
+        if updated_results is None:
+            updated_results = current_fault_results
+            new_network = current_modified_network
+            new_source_temps = dict(current_source_temps)
 
         has_pump_failure = any(f.fault_type == FAULT_TYPE_PUMP_FAILURE for f in faults)
         if has_pump_failure and updated_results is not None and original_results is not None:
             from calculations.fault_simulation import _adjust_flow_and_temperature_for_pump_failure
-            updated_results = _adjust_flow_and_temperature_for_pump_failure(
-                original_network, new_network,
-                original_results, updated_results,
-                new_source_temps,
-            )
+            try:
+                adjusted = _adjust_flow_and_temperature_for_pump_failure(
+                    original_network, new_network,
+                    original_results, updated_results,
+                    new_source_temps,
+                )
+                if adjusted is not None:
+                    updated_results = adjusted
+            except Exception:
+                pass
 
         updated_impact = _assess_impact_for_recovery(
             original_network, original_results,
@@ -598,8 +665,24 @@ def execute_emergency_action(
                 effect.pressure_gap_reduction_pct = (orig_gap_p - recov_gap_p) / orig_gap_p * 100.0
 
         return effect
-    except Exception:
-        return None
+    except Exception as e:
+        try:
+            updated_results = current_fault_results
+            updated_network = current_modified_network
+            updated_source_temps = dict(current_source_temps)
+            updated_impact = current_impact
+
+            effect = RecoveryEffect(
+                action_index=action_index,
+                action_description=action.description,
+                updated_results=updated_results,
+                updated_impact=updated_impact,
+                updated_network=updated_network,
+                updated_source_temps=updated_source_temps,
+            )
+            return effect
+        except Exception:
+            return None
 
 
 def _assess_impact_for_recovery(

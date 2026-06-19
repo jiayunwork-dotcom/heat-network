@@ -1101,6 +1101,9 @@ with tabs[7]:
                     fig_risk = go.Figure()
                     risk_names = [item.device_name for item in st.session_state.risk_assessment_results]
                     risk_scores = [item.risk_score for item in st.session_state.risk_assessment_results]
+                    risk_types = [item.device_type for item in st.session_state.risk_assessment_results]
+                    risk_probs = [item.fault_probability * 100 for item in st.session_state.risk_assessment_results]
+                    risk_drops = [item.heat_capacity_drop_pct for item in st.session_state.risk_assessment_results]
                     risk_colors = []
                     for item in st.session_state.risk_assessment_results:
                         if item.device_type == "管段":
@@ -1109,19 +1112,31 @@ with tabs[7]:
                             risk_colors.append("#f39c12")
                         else:
                             risk_colors.append("#3498db")
+                    custom_hovertemplate = (
+                        '<b>%{x}</b><br>' +
+                        '风险评分: %{y:.2f}<br>' +
+                        '设备类型: %{customdata[0]}<br>' +
+                        '故障概率: %{customdata[1]:.0f}%<br>' +
+                        '供热能力下降: %{customdata[2]:.1f}%' +
+                        '<extra></extra>'
+                    )
                     fig_risk.add_trace(go.Bar(
                         x=risk_names,
                         y=risk_scores,
                         marker_color=risk_colors,
                         text=[f"{s:.2f}" for s in risk_scores],
                         textposition='outside',
+                        customdata=list(zip(risk_types, risk_probs, risk_drops)),
+                        hovertemplate=custom_hovertemplate,
                     ))
                     fig_risk.update_layout(
                         xaxis_title="设备名称",
                         yaxis_title="风险评分",
+                        yaxis=dict(tickformat='.2f'),
                         height=400,
                         margin=dict(l=40, r=40, t=40, b=120),
                         xaxis_tickangle=-30,
+                        hovermode='x unified',
                     )
                     st.plotly_chart(fig_risk, use_container_width=True)
                     st.caption("🔴 红色=管段 | 🟡 橙色=泵站 | 🔵 蓝色=热源")
