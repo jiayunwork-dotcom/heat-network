@@ -29,6 +29,10 @@ from calculations import (
     EmergencyAction, EmergencyPlan, RecoveryEffect,
     generate_emergency_plan, DEFAULT_TEMP_WARNING_THRESHOLD,
     calculate_risk_assessment, execute_emergency_action,
+    run_economic_optimization,
+    DEFAULT_ELECTRICITY_PRICE, DEFAULT_GAS_PRICE, DEFAULT_GAS_CALORIFIC_VALUE,
+    DEFAULT_BOILER_EFFICIENCY, DEFAULT_PAYBACK_THRESHOLD,
+    EconomicOptimizationResult,
 )
 from visualization import (
     create_network_topology_figure,
@@ -38,6 +42,8 @@ from visualization import (
     create_heat_loss_pareto_figure,
     create_energy_consumption_pie_figure,
     create_fault_topology_figure,
+    create_operating_cost_pie_figure,
+    create_retrofit_investment_bar_figure,
 )
 from report import generate_pdf_report
 
@@ -114,6 +120,18 @@ def init_session():
         st.session_state.risk_assessment_results = None
     if "risk_mode_enabled" not in st.session_state:
         st.session_state.risk_mode_enabled = False
+    if "economic_results" not in st.session_state:
+        st.session_state.economic_results = None
+    if "electricity_price" not in st.session_state:
+        st.session_state.electricity_price = DEFAULT_ELECTRICITY_PRICE
+    if "gas_price" not in st.session_state:
+        st.session_state.gas_price = DEFAULT_GAS_PRICE
+    if "gas_calorific_value" not in st.session_state:
+        st.session_state.gas_calorific_value = DEFAULT_GAS_CALORIFIC_VALUE
+    if "boiler_efficiency" not in st.session_state:
+        st.session_state.boiler_efficiency = DEFAULT_BOILER_EFFICIENCY
+    if "payback_threshold" not in st.session_state:
+        st.session_state.payback_threshold = DEFAULT_PAYBACK_THRESHOLD
 
 
 init_session()
@@ -333,6 +351,21 @@ if run_btn and st.session_state.network is not None:
             )
             st.session_state.flow_ratios = flow_ratios
             st.session_state.valve_suggestions = suggestions
+
+            try:
+                eco_results = run_economic_optimization(
+                    st.session_state.network, results,
+                    electricity_price=st.session_state.electricity_price,
+                    gas_price=st.session_state.gas_price,
+                    gas_calorific_value=st.session_state.gas_calorific_value,
+                    boiler_efficiency=st.session_state.boiler_efficiency,
+                    payback_threshold=st.session_state.payback_threshold,
+                )
+                st.session_state.economic_results = eco_results
+            except Exception as eco_e:
+                st.warning(f"⚠️ 经济优化计算失败：{eco_e}")
+                st.session_state.economic_results = None
+
             st.success(
                 f"✅ 计算完成！{'已收敛' if results.converged else '⚠️ 未完全收敛'} "
                 f"(迭代{results.iterations}次)"
@@ -346,7 +379,8 @@ if run_btn and st.session_state.network is not None:
 tabs = st.tabs([
     "📊 总览仪表盘", "🌐 管网拓扑与可视化", "💧 水力计算结果",
     "🌡️ 热力计算结果", "⚡ 能耗分析", "🔧 水力平衡与优化",
-    "📈 工况对比", "🚨 故障模拟与应急预案", "📝 管网数据编辑", "📄 报告导出"
+    "💰 经济优化", "📈 工况对比", "🚨 故障模拟与应急预案",
+    "📝 管网数据编辑", "📄 报告导出"
 ])
 
 with tabs[0]:
@@ -721,6 +755,199 @@ with tabs[5]:
             st.success("✅ 所有末端用户流量偏差均在允许范围内，水力平衡状态良好，无需阀门调节。")
 
 with tabs[6]:
+    st.subheader("💰 管网经济性优化与改造方案推荐")
+    if st.session_state.results is None:
+        st.info("👈 请先加载管网数据并运行水力热力耦合计算")
+    else:
+        net = st.session_state.network
+        r: NetworkResults = st.session_state.results
+        eco: EconomicOptimizationResult = st.session_state.economic_results
+
+        with st.expander("⚙️ 经济参数设置", expanded=False):
+            col_p1, col_p2, col_p3 = st.columns(3)
+            with col_p1:
+                st.session_state.electricity_price = st.number_input(
+                    "电价 (元/kWh)",
+                    min_value=0.1, max_value=5.0,
+                    value=st.session_state.electricity_price,
+                    step=0.05,
+                )
+                st.session_state.gas_price = st.number_input(
+                    "天然气单价 (元/立方米)",
+                    min_value=1.0, max_value=10.0,
+                    value=st.session_state.gas_price,
+                    step=0.1,
+                )
+            with col_p2:
+                st.session_state.gas_calorific_value = st.number_input(
+                    "天然气热值 (MJ/立方米)",
+                    min_value=20.0, max_value=50.0,
+                    value=st.session_state.gas_calorific_value,
+                    step=0.5,
+                )
+                st.session_state.boiler_efficiency = st.number_input(
+                    "锅炉效率",
+                    min_value=0.5, max_value=1.0,
+                    value=st.session_state.boiler_efficiency,
+                    step=0.01,
+                )
+            with col_p3:
+                st.session_state.payback_threshold = st.number_input(
+                    "投资回报期筛选阈值 (年)",
+                    min_value=1.0, max_value=20.0,
+                    value=st.session_state.payback_threshold,
+                    step=0.5,
+                )
+            if st.button("🔄 重新计算经济优化", use_container_width=True):
+                try:
+                    eco_new = run_economic_optimization(
+                        net, r,
+                        electricity_price=st.session_state.electricity_price,
+                        gas_price=st.session_state.gas_price,
+                        gas_calorific_value=st.session_state.gas_calorific_value,
+                        boiler_efficiency=st.session_state.boiler_efficiency,
+                        payback_threshold=st.session_state.payback_threshold,
+                    )
+                    st.session_state.economic_results = eco_new
+                    st.success("✅ 经济优化计算完成")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ 经济优化计算失败：{e}")
+
+        if eco is None:
+            st.warning("⚠️ 暂无经济优化结果，请点击上方'重新计算经济优化'按钮")
+        else:
+            op_cost = eco.operating_cost
+            st.markdown("##### 📊 运行成本核算")
+            m_cost1, m_cost2, m_cost3, m_cost4 = st.columns(4)
+            with m_cost1:
+                st.metric(
+                    "日运行总成本",
+                    f"{op_cost.total_daily_cost:,.0f} 元",
+                )
+            with m_cost2:
+                st.metric(
+                    "年运行总成本",
+                    f"{op_cost.total_annual_cost:,.0f} 元",
+                )
+            with m_cost3:
+                st.metric(
+                    "日电费",
+                    f"{op_cost.electricity_cost_daily:,.0f} 元",
+                    delta=f"占比 {op_cost.electricity_cost_annual/max(op_cost.total_annual_cost,1)*100:.1f}%",
+                    delta_color="off",
+                )
+            with m_cost4:
+                st.metric(
+                    "年维护成本",
+                    f"{op_cost.maintenance_cost_annual:,.0f} 元",
+                )
+            st.divider()
+
+            col_left, col_right = st.columns([1, 1.4])
+
+            with col_left:
+                st.markdown("###### 🥧 年运行成本构成")
+                fig_cost_pie = create_operating_cost_pie_figure(op_cost)
+                st.plotly_chart(fig_cost_pie, use_container_width=True)
+
+                st.divider()
+                st.markdown("###### 📋 成本明细")
+                cost_detail_rows = [
+                    ["泵站电费（年）", f"{op_cost.electricity_cost_annual:,.0f} 元",
+                     f"{op_cost.electricity_cost_annual/max(op_cost.total_annual_cost,1)*100:.1f}%"],
+                    ["热损失成本（年）", f"{op_cost.heat_loss_cost_annual:,.0f} 元",
+                     f"{op_cost.heat_loss_cost_annual/max(op_cost.total_annual_cost,1)*100:.1f}%"],
+                    ["维护成本（年）", f"{op_cost.maintenance_cost_annual:,.0f} 元",
+                     f"{op_cost.maintenance_cost_annual/max(op_cost.total_annual_cost,1)*100:.1f}%"],
+                    ["合计（年）", f"{op_cost.total_annual_cost:,.0f} 元", "100%"],
+                ]
+                st.table(pd.DataFrame(cost_detail_rows, columns=["项目", "金额", "占比"]))
+
+            with col_right:
+                st.markdown("###### 📋 综合改造推荐列表（按投资回报期排序）")
+                if not eco.comprehensive_list:
+                    st.info(f"💡 暂无回报期低于 {st.session_state.payback_threshold} 年的改造项目")
+                else:
+                    retro_rows = []
+                    for idx, item in enumerate(eco.comprehensive_list, 1):
+                        retro_rows.append({
+                            "序号": idx,
+                            "项目名称": item.item_name,
+                            "改造类型": item.retrofit_type,
+                            "投资额(元)": f"{item.investment:,.0f}",
+                            "年节省(元)": f"{item.annual_saving:,.0f}",
+                            "回报期(年)": f"{item.payback_period:.2f}",
+                        })
+                    df_retro = pd.DataFrame(retro_rows)
+                    st.dataframe(df_retro, use_container_width=True, hide_index=True, height=320)
+
+                    st.divider()
+                    m_inv1, m_inv2, m_inv3 = st.columns(3)
+                    with m_inv1:
+                        st.metric("改造总投资额", f"{eco.total_investment:,.0f} 元")
+                    with m_inv2:
+                        st.metric("预计总年节省", f"{eco.total_annual_saving:,.0f} 元")
+                    with m_inv3:
+                        st.metric(
+                            "整体投资回报期",
+                            f"{eco.overall_payback_period:.2f} 年"
+                            if eco.overall_payback_period != float('inf')
+                            else "—",
+                        )
+
+                st.divider()
+                st.markdown("###### 📊 改造项目投资额 vs 年节省额对比")
+                fig_bar = create_retrofit_investment_bar_figure(eco.comprehensive_list)
+                st.plotly_chart(fig_bar, use_container_width=True)
+
+            st.divider()
+            tab_insulation, tab_pump = st.tabs(["🔧 保温改造详细分析", "⛽ 泵站能效优化分析"])
+
+            with tab_insulation:
+                st.markdown("###### 管段保温改造评估")
+                if not eco.insulation_retrofits:
+                    st.info("💡 暂无保温改造建议")
+                else:
+                    ins_rows = []
+                    for ir in eco.insulation_retrofits:
+                        ins_rows.append({
+                            "管段名称": ir.pipe_name,
+                            "原厚度(mm)": f"{ir.original_thickness*1000:.0f}",
+                            "新厚度(mm)": f"{ir.new_thickness*1000:.0f}",
+                            "原热损失(kW)": f"{ir.original_heat_loss/1000:.2f}",
+                            "新热损失(kW)": f"{ir.new_heat_loss/1000:.2f}",
+                            "节能量(kW)": f"{ir.heat_loss_saving/1000:.2f}",
+                            "年节省(元)": f"{ir.annual_gas_saving:,.0f}",
+                            "投资额(元)": f"{ir.investment:,.0f}",
+                            "回报期(年)": f"{ir.payback_period:.2f}",
+                        })
+                    st.dataframe(pd.DataFrame(ins_rows), use_container_width=True, hide_index=True, height=400)
+                    st.caption(f"💡 筛选标准：回报期 ≤ {st.session_state.payback_threshold} 年的管段优先推荐")
+
+            with tab_pump:
+                st.markdown("###### 泵站能效优化分析")
+                if not eco.pump_retrofits:
+                    st.info("💡 管网中没有泵站")
+                else:
+                    pump_rows = []
+                    for pr in eco.pump_retrofits:
+                        pump_rows.append({
+                            "泵站名称": pr.pipe_name,
+                            "额定扬程(m)": f"{pr.rated_head:.1f}",
+                            "实际扬程(m)": f"{pr.actual_head:.1f}",
+                            "扬程比": f"{pr.actual_head/pr.rated_head*100:.1f}%" if pr.rated_head > 0 else "—",
+                            "当前功率(kW)": f"{pr.current_power:.2f}",
+                            "工况状态": pr.status,
+                            "变频改造建议": "✅ 推荐" if pr.has_vfd_recommendation else "❌ 暂不需要",
+                            "年节电(元)": f"{pr.vfd_annual_saving:,.0f}" if pr.has_vfd_recommendation else "—",
+                            "投资额(元)": f"{pr.vfd_investment:,.0f}" if pr.has_vfd_recommendation else "—",
+                            "回报期(年)": f"{pr.vfd_payback_period:.2f}" if pr.has_vfd_recommendation and pr.vfd_payback_period != float('inf') else "—",
+                        })
+                    st.dataframe(pd.DataFrame(pump_rows), use_container_width=True, hide_index=True, height=400)
+                    st.caption("💡 判定标准：实际扬程低于额定扬程60%或高于110%时，标记为'工况偏离严重'，建议加装变频器")
+
+with tabs[7]:
     st.subheader("📈 工况对比分析")
     if not st.session_state.saved_conditions:
         st.info("💡 请先在侧边栏保存至少2个工况后再进行对比分析")
@@ -958,7 +1185,7 @@ with tabs[6]:
                     param_rows.append(row)
                 st.dataframe(pd.DataFrame(param_rows), use_container_width=True, hide_index=True)
 
-with tabs[7]:
+with tabs[8]:
     st.subheader("🚨 管网故障模拟与应急预案")
     if st.session_state.network is None or st.session_state.results is None:
         st.info("👈 请先加载管网数据并运行正常工况计算，然后再进行故障模拟")
@@ -1800,7 +2027,7 @@ with tabs[7]:
                                         st.session_state["_pending_recall"] = None
                                     st.divider()
 
-with tabs[8]:
+with tabs[9]:
     st.subheader("📝 管网数据编辑")
     net = st.session_state.network
     if net is None:
@@ -1979,7 +2206,7 @@ with tabs[8]:
                 t = st.slider(f"{sn.name} 供水温度 (°C)", 60.0, 150.0, float(default_t), 1.0, key=f"src_t_{sn.id}")
                 st.session_state.source_temps[sn.id] = t
 
-with tabs[9]:
+with tabs[10]:
     st.subheader("📄 供热运行分析报告导出")
     if st.session_state.results is None:
         st.info("请先运行计算后再导出报告")

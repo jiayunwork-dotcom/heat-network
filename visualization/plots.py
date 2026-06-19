@@ -776,3 +776,78 @@ def create_fault_topology_figure(
         height=600,
     )
     return fig
+
+
+def create_operating_cost_pie_figure(
+    op_cost,
+) -> go.Figure:
+    labels = ['泵站电费', '热损失成本', '维护成本']
+    values = [
+        op_cost.electricity_cost_annual,
+        op_cost.heat_loss_cost_annual,
+        op_cost.maintenance_cost_annual,
+    ]
+    colors = ['#45b7d1', '#ff6b6b', '#ffd93d']
+
+    fig = go.Figure(data=[go.Pie(
+        labels=labels,
+        values=values,
+        hole=0.4,
+        marker=dict(colors=colors),
+        textinfo='label+percent',
+        textposition='outside',
+        hovertemplate='<b>%{label}</b><br>年成本: %{value:,.0f} 元<br>占比: %{percent}<extra></extra>',
+    )])
+
+    total_annual = op_cost.total_annual_cost
+    fig.update_layout(
+        title=dict(text=f"年运行成本构成（合计：{total_annual:,.0f} 元/年）", x=0.5),
+        margin=dict(l=20, r=20, t=60, b=20),
+        height=400,
+        legend=dict(orientation="h", yanchor="bottom", y=-0.1),
+    )
+    return fig
+
+
+def create_retrofit_investment_bar_figure(
+    retrofit_items,
+) -> go.Figure:
+    if not retrofit_items:
+        return go.Figure().add_annotation(
+            text="无推荐改造项目",
+            showarrow=False,
+            font=dict(size=16),
+        )
+
+    names = [item.item_name for item in retrofit_items]
+    investments = [item.investment for item in retrofit_items]
+    savings = [item.annual_saving for item in retrofit_items]
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Bar(
+        x=names,
+        y=investments,
+        name='投资额 (元)',
+        marker_color='#ff6b6b',
+        hovertemplate='<b>%{x}</b><br>投资额: %{y:,.0f} 元<extra></extra>',
+    ))
+
+    fig.add_trace(go.Bar(
+        x=names,
+        y=savings,
+        name='年节省额 (元)',
+        marker_color='#4ecdc4',
+        hovertemplate='<b>%{x}</b><br>年节省: %{y:,.0f} 元<extra></extra>',
+    ))
+
+    fig.update_layout(
+        title=dict(text="改造项目投资额 vs 年节省额对比", x=0.5),
+        xaxis=dict(title="改造项目", tickangle=-30, showgrid=True),
+        yaxis=dict(title="金额 (元)", showgrid=True),
+        barmode='group',
+        height=450,
+        margin=dict(l=60, r=40, t=60, b=100),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    return fig

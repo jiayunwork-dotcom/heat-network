@@ -23,6 +23,16 @@ from calculations.emergency_plan import (
     generate_emergency_plan, execute_emergency_action,
     DEFAULT_MIN_TEMP_THRESHOLD, DEFAULT_TEMP_WARNING_THRESHOLD,
 )
+from calculations.economic_optimization import (
+    OperatingCostBreakdown, PipeInsulationRetrofit, PumpEfficiencyRetrofit,
+    ComprehensiveRetrofitItem, EconomicOptimizationResult,
+    calculate_operating_cost, analyze_insulation_retrofit,
+    analyze_pump_efficiency, generate_comprehensive_retrofit_list,
+    run_economic_optimization,
+    DEFAULT_ELECTRICITY_PRICE, DEFAULT_GAS_PRICE, DEFAULT_GAS_CALORIFIC_VALUE,
+    DEFAULT_BOILER_EFFICIENCY, DEFAULT_PAYBACK_THRESHOLD,
+    INSULATION_UNIT_COST,
+)
 
 __all__ = [
     "solve_colebrook_white", "compute_pipe_hydraulics", "compute_pump_head",
@@ -39,4 +49,12 @@ __all__ = [
     "EmergencyAction", "EmergencyPlan", "RecoveryEffect",
     "generate_emergency_plan", "execute_emergency_action",
     "DEFAULT_MIN_TEMP_THRESHOLD", "DEFAULT_TEMP_WARNING_THRESHOLD",
+    "OperatingCostBreakdown", "PipeInsulationRetrofit", "PumpEfficiencyRetrofit",
+    "ComprehensiveRetrofitItem", "EconomicOptimizationResult",
+    "calculate_operating_cost", "analyze_insulation_retrofit",
+    "analyze_pump_efficiency", "generate_comprehensive_retrofit_list",
+    "run_economic_optimization",
+    "DEFAULT_ELECTRICITY_PRICE", "DEFAULT_GAS_PRICE", "DEFAULT_GAS_CALORIFIC_VALUE",
+    "DEFAULT_BOILER_EFFICIENCY", "DEFAULT_PAYBACK_THRESHOLD",
+    "INSULATION_UNIT_COST",
 ]
