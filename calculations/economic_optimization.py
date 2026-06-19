@@ -609,16 +609,18 @@ def calculate_cash_flow(
         year_saving = 0.0
 
         if year == 0:
-            if phase_plan and phase_plan[0].year == 1:
-                year_investment = phase_plan[0].annual_investment
+            for phase in phase_plan:
+                if phase.year == 1:
+                    year_investment = phase.annual_investment
+                    break
             cumulative = -year_investment
         else:
             for phase in phase_plan:
                 if phase.year <= year:
                     year_saving += phase.annual_saving
-            if year + 1 <= max_year:
+            if year >= 2:
                 for phase in phase_plan:
-                    if phase.year == year + 1:
+                    if phase.year == year:
                         year_investment = phase.annual_investment
                         break
             cumulative = cumulative + year_saving - year_investment
