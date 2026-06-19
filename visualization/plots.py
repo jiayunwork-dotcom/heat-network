@@ -559,3 +559,220 @@ def create_energy_consumption_pie_figure(
         legend=dict(orientation="h", yanchor="bottom", y=-0.1),
     )
     return fig
+
+
+def create_fault_topology_figure(
+    original_network: PipeNetwork,
+    fault_results: Optional[NetworkResults],
+    impact,
+    faults,
+    original_results: Optional[NetworkResults] = None,
+) -> go.Figure:
+    fig = go.Figure()
+
+    burst_pipe_ids = set()
+    failed_pump_ids = set()
+    shutdown_source_ids = set()
+    for f in faults:
+        if f.fault_type == "pipe_burst":
+            burst_pipe_ids.add(f.target_id)
+        elif f.fault_type == "pump_failure":
+            failed_pump_ids.add(f.target_id)
+        elif f.fault_type == "source_shutdown":
+            shutdown_source_ids.add(f.target_id)
+
+    affected_user_set = set(impact.affected_user_ids) if impact else set()
+    disconnected_user_set = set(impact.disconnected_user_ids) if impact else set()
+    low_pressure_set = set(impact.low_pressure_users) if impact else set()
+
+    display_network = original_network
+    display_results = fault_results if fault_results else original_results
+
+    max_flow = 0.0
+    if display_results:
+        for pr in display_results.pipe_results.values():
+            if abs(pr.flow_rate) > max_flow:
+                max_flow = abs(pr.flow_rate)
+    if max_flow < 1e-6:
+        max_flow = 1.0
+
+    for pid, pipe in original_network.pipes.items():
+        sn = original_network.nodes[pipe.start_node_id]
+        en = original_network.nodes[pipe.end_node_id]
+        sx, sy = (sn.x, sn.y) if sn.x is not None else (0.0, 0.0)
+        ex, ey = (en.x, en.y) if en.x is not None else (0.0, 0.0)
+
+        pr = None
+        if display_results and pid in display_results.pipe_results:
+            pr = display_results.pipe_results[pid]
+
+        is_burst = pid in burst_pipe_ids
+        is_failed_pump = pid in failed_pump_ids
+
+        if is_burst:
+            line_color = "#ff0000"
+            line_width = 6.0
+            line_dash = "dash"
+        elif is_failed_pump:
+            line_color = "#ff8800"
+            line_width = 5.0
+            line_dash = "dashdot"
+        else:
+            line_color = "#888888"
+            flow = pr.flow_rate if pr else 0.001
+            line_width = float(1.0 + 5.0 * abs(flow) / max_flow)
+            line_dash = "solid"
+
+        hover_text = f"<b>{pipe.name}</b><br>管径: {pipe.diameter*1000:.0f}mm<br>长度: {pipe.length:.0f}m"
+        if pr:
+            hover_text += (
+                f"<br>流量: {pr.flow_rate*1000:.1f} L/s<br>"
+                f"进口温度: {pr.inlet_temperature:.2f}°C<br>"
+                f"出口温度: {pr.outlet_temperature:.2f}°C"
+            )
+        if is_burst:
+            hover_text = "🚨 <b>[爆管故障]</b><br>" + hover_text
+        if is_failed_pump:
+            hover_text = "⚠️ <b>[泵站故障]</b><br>" + hover_text
+        if pipe.has_pump and pr:
+            hover_text += f"<br><b>泵站</b>: 扬程{abs(pr.pump_head):.1f}m"
+
+        fig.add_trace(go.Scatter(
+            x=[float(sx), float(ex)],
+            y=[float(sy), float(ey)],
+            mode='lines',
+            line=dict(
+                width=line_width,
+                color=line_color,
+                dash=line_dash,
+            ),
+            hoverinfo='skip',
+            showlegend=False,
+        ))
+        mid_x = float((sx + ex) / 2.0)
+        mid_y = float((sy + ey) / 2.0)
+        fig.add_trace(go.Scatter(
+            x=[mid_x], y=[mid_y],
+            mode='markers',
+            marker=dict(size=1, color=line_color, opacity=0.01),
+            hoverinfo='text',
+            text=hover_text,
+            showlegend=False,
+        ))
+
+    node_type_colors = {
+        NODE_TYPE_SOURCE: "#ff4444",
+        NODE_TYPE_HEAT_EXCHANGER: "#ffaa00",
+        NODE_TYPE_BRANCH: "#4488ff",
+        NODE_TYPE_END_USER: "#44cc88",
+    }
+    node_type_sizes = {
+        NODE_TYPE_SOURCE: 20,
+        NODE_TYPE_HEAT_EXCHANGER: 16,
+        NODE_TYPE_BRANCH: 10,
+        NODE_TYPE_END_USER: 14,
+    }
+    type_labels = {
+        NODE_TYPE_SOURCE: "热源",
+        NODE_TYPE_HEAT_EXCHANGER: "换热站",
+        NODE_TYPE_BRANCH: "分支点",
+        NODE_TYPE_END_USER: "末端用户",
+    }
+
+    for ntype in [NODE_TYPE_SOURCE, NODE_TYPE_HEAT_EXCHANGER, NODE_TYPE_BRANCH, NODE_TYPE_END_USER]:
+        nodes_of_type = original_network.get_nodes_by_type(ntype)
+        for node in nodes_of_type:
+            nx, ny = (node.x, node.y) if node.x is not None else (0, 0)
+
+            is_shutdown = node.id in shutdown_source_ids
+            is_disconnected = node.id in disconnected_user_set
+            is_low_pressure = node.id in low_pressure_set
+            is_affected = node.id in affected_user_set
+
+            marker_color = node_type_colors[ntype]
+            marker_size = node_type_sizes[ntype]
+            marker_symbol = 'circle'
+            marker_line_width = 2
+            marker_line_color = 'white'
+
+            prefix = ""
+            if is_shutdown:
+                prefix = "🛑 <b>[已停机]</b><br>"
+                marker_color = "#333333"
+                marker_symbol = 'x'
+                marker_size = marker_size + 4
+            elif is_disconnected:
+                prefix = "❌ <b>[断供]</b><br>"
+                marker_color = "#cc0000"
+                marker_line_color = "#ff0000"
+                marker_line_width = 3
+                marker_size = marker_size + 4
+            elif is_low_pressure:
+                prefix = "⚠️ <b>[压力不足]</b><br>"
+                marker_color = "#ff6600"
+                marker_line_color = "#ff3300"
+                marker_line_width = 3
+            elif is_affected and ntype == NODE_TYPE_END_USER:
+                prefix = "🔶 <b>[受影响]</b><br>"
+                marker_line_color = "#ffaa00"
+                marker_line_width = 3
+
+            nr = None
+            if display_results and node.id in display_results.node_results:
+                nr = display_results.node_results[node.id]
+
+            hover = prefix + f"<b>{node.name}</b> [{type_labels[ntype]}]<br>标高: {node.elevation:.1f}m"
+            if nr:
+                hover += f"<br>压力: {nr.pressure:.2f} mH₂O<br>温度: {nr.temperature:.2f}°C"
+            if node.design_flow:
+                hover += f"<br>设计流量: {node.design_flow*1000:.1f} L/s"
+                if nr:
+                    hover += f"<br>实际流量: {nr.flow_in*1000:.1f} L/s"
+
+            legend_name = type_labels[ntype]
+            if is_shutdown:
+                legend_name = "已停机热源"
+            elif is_disconnected:
+                legend_name = "断供用户"
+            elif is_low_pressure:
+                legend_name = "压力不足用户"
+            elif is_affected and ntype == NODE_TYPE_END_USER:
+                legend_name = "受影响用户"
+
+            show_legend = False
+            if ntype == NODE_TYPE_SOURCE and is_shutdown:
+                show_legend = True
+            elif ntype == NODE_TYPE_END_USER and is_disconnected:
+                show_legend = True
+            elif ntype == NODE_TYPE_END_USER and is_low_pressure:
+                show_legend = True
+            elif ntype == NODE_TYPE_END_USER and is_affected and not is_low_pressure and not is_disconnected:
+                show_legend = True
+            elif not is_shutdown and not is_disconnected and not is_low_pressure and not (is_affected and ntype == NODE_TYPE_END_USER):
+                show_legend = (ntype == NODE_TYPE_SOURCE or ntype == NODE_TYPE_END_USER)
+
+            fig.add_trace(go.Scatter(
+                x=[nx], y=[ny],
+                mode='markers',
+                marker=dict(
+                    size=marker_size,
+                    color=marker_color,
+                    line=dict(width=marker_line_width, color=marker_line_color),
+                    symbol=marker_symbol,
+                ),
+                text=hover,
+                hoverinfo='text',
+                name=legend_name,
+                showlegend=show_legend,
+            ))
+
+    fig.update_layout(
+        title=dict(text="🚨 故障工况管网拓扑图（红色=爆管/断供，橙色=故障泵站/低压用户）", x=0.5),
+        xaxis=dict(title="X坐标 (m)", showgrid=True, zeroline=False, scaleanchor="y", scaleratio=1),
+        yaxis=dict(title="Y坐标 (m)", showgrid=True, zeroline=False),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        plot_bgcolor='rgba(240,248,255,0.3)',
+        margin=dict(l=40, r=40, t=80, b=40),
+        height=600,
+    )
+    return fig

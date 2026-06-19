@@ -5,6 +5,7 @@ from visualization.plots import (
     create_pump_operating_point_figures,
     create_heat_loss_pareto_figure,
     create_energy_consumption_pie_figure,
+    create_fault_topology_figure,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "create_pump_operating_point_figures",
     "create_heat_loss_pareto_figure",
     "create_energy_consumption_pie_figure",
+    "create_fault_topology_figure",
 ]

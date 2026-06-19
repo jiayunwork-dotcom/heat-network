@@ -21,6 +21,13 @@ from models import (
 from calculations import (
     solve_coupled, analyze_hydraulic_balance,
     optimize_source_allocation_equal, optimize_source_allocation_min_energy,
+    FaultConfig, ImpactAssessment,
+    FAULT_TYPE_PIPE_BURST, FAULT_TYPE_PUMP_FAILURE, FAULT_TYPE_SOURCE_SHUTDOWN,
+    FAULT_TYPE_CN, MIN_OPERATING_PRESSURE,
+    simulate_faults,
+    get_available_pump_pipes, get_available_source_nodes, get_available_pipes,
+    EmergencyAction, EmergencyPlan,
+    generate_emergency_plan, DEFAULT_TEMP_WARNING_THRESHOLD,
 )
 from visualization import (
     create_network_topology_figure,
@@ -29,6 +36,7 @@ from visualization import (
     create_pump_operating_point_figures,
     create_heat_loss_pareto_figure,
     create_energy_consumption_pie_figure,
+    create_fault_topology_figure,
 )
 from report import generate_pdf_report
 
@@ -79,6 +87,16 @@ def init_session():
         st.session_state.saved_conditions = {}
     if "temp_threshold" not in st.session_state:
         st.session_state.temp_threshold = 65.0
+    if "fault_list" not in st.session_state:
+        st.session_state.fault_list = []
+    if "fault_results" not in st.session_state:
+        st.session_state.fault_results = None
+    if "fault_impact" not in st.session_state:
+        st.session_state.fault_impact = None
+    if "fault_modified_network" not in st.session_state:
+        st.session_state.fault_modified_network = None
+    if "emergency_plan" not in st.session_state:
+        st.session_state.emergency_plan = None
 
 
 init_session()
@@ -311,7 +329,7 @@ if run_btn and st.session_state.network is not None:
 tabs = st.tabs([
     "📊 总览仪表盘", "🌐 管网拓扑与可视化", "💧 水力计算结果",
     "🌡️ 热力计算结果", "⚡ 能耗分析", "🔧 水力平衡与优化",
-    "📈 工况对比", "📝 管网数据编辑", "📄 报告导出"
+    "📈 工况对比", "🚨 故障模拟与应急预案", "📝 管网数据编辑", "📄 报告导出"
 ])
 
 with tabs[0]:
@@ -924,6 +942,342 @@ with tabs[6]:
                 st.dataframe(pd.DataFrame(param_rows), use_container_width=True, hide_index=True)
 
 with tabs[7]:
+    st.subheader("🚨 管网故障模拟与应急预案")
+    if st.session_state.network is None or st.session_state.results is None:
+        st.info("👈 请先加载管网数据并运行正常工况计算，然后再进行故障模拟")
+    else:
+        net = st.session_state.network
+        normal_results = st.session_state.results
+
+        col_left, col_right = st.columns([1, 1.4])
+
+        with col_left:
+            st.markdown("##### 🎯 故障设置区")
+            st.info("💡 可添加多个故障进行组合模拟（如：管段爆管 + 泵站故障同时发生）")
+
+            fault_descriptions = []
+            for i, f in enumerate(st.session_state.fault_list):
+                fault_descriptions.append(f"{i+1}. {f.describe(net)}")
+            if fault_descriptions:
+                with st.expander(f"📋 已设置故障 ({len(st.session_state.fault_list)} 项)", expanded=True):
+                    for fd in fault_descriptions:
+                        st.write(fd)
+                    if st.button("🗑️ 清空所有故障", use_container_width=True):
+                        st.session_state.fault_list = []
+                        st.session_state.fault_results = None
+                        st.session_state.fault_impact = None
+                        st.session_state.fault_modified_network = None
+                        st.session_state.emergency_plan = None
+                        st.rerun()
+            else:
+                st.caption("尚未设置任何故障")
+
+            st.divider()
+            st.markdown("###### ➕ 添加新故障")
+            new_fault_type = st.selectbox(
+                "故障类型",
+                list(FAULT_TYPE_CN.keys()),
+                format_func=lambda x: FAULT_TYPE_CN[x],
+                key="new_fault_type_select",
+            )
+
+            if new_fault_type == FAULT_TYPE_PIPE_BURST:
+                all_pipes = get_available_pipes(net)
+                pipe_options = [(p.id, p.name) for p in all_pipes]
+                existing_burst = {f.target_id for f in st.session_state.fault_list if f.fault_type == FAULT_TYPE_PIPE_BURST}
+                pipe_options = [(pid, pname) for pid, pname in pipe_options if pid not in existing_burst]
+                if pipe_options:
+                    selected_pipe = st.selectbox(
+                        "选择爆管管段",
+                        pipe_options,
+                        format_func=lambda x: f"{x[1]} (ID:{x[0]})",
+                        key="burst_pipe_select",
+                    )
+                    if st.button("➕ 添加管段爆管故障", use_container_width=True):
+                        st.session_state.fault_list.append(
+                            FaultConfig(fault_type=FAULT_TYPE_PIPE_BURST, target_id=selected_pipe[0])
+                        )
+                        st.rerun()
+                else:
+                    st.warning("所有管段均已设置为爆管故障")
+
+            elif new_fault_type == FAULT_TYPE_PUMP_FAILURE:
+                pump_pipes = get_available_pump_pipes(net)
+                if not pump_pipes:
+                    st.warning("管网中没有泵站")
+                else:
+                    pump_options = [(p.id, p.name) for p in pump_pipes]
+                    existing_pump_fail = {f.target_id for f in st.session_state.fault_list if f.fault_type == FAULT_TYPE_PUMP_FAILURE}
+                    pump_options = [(pid, pname) for pid, pname in pump_options if pid not in existing_pump_fail]
+                    if pump_options:
+                        selected_pump = st.selectbox(
+                            "选择故障泵站",
+                            pump_options,
+                            format_func=lambda x: f"{x[1]} (ID:{x[0]})",
+                            key="failed_pump_select",
+                        )
+                        if st.button("➕ 添加泵站故障", use_container_width=True):
+                            st.session_state.fault_list.append(
+                                FaultConfig(fault_type=FAULT_TYPE_PUMP_FAILURE, target_id=selected_pump[0])
+                            )
+                            st.rerun()
+                    else:
+                        st.warning("所有泵站均已设置为故障")
+
+            elif new_fault_type == FAULT_TYPE_SOURCE_SHUTDOWN:
+                source_nodes = get_available_source_nodes(net)
+                source_options = [(n.id, n.name) for n in source_nodes]
+                existing_shutdown = {f.target_id for f in st.session_state.fault_list if f.fault_type == FAULT_TYPE_SOURCE_SHUTDOWN}
+                source_options = [(sid, sname) for sid, sname in source_options if sid not in existing_shutdown]
+                if source_options:
+                    selected_source = st.selectbox(
+                        "选择停机热源",
+                        source_options,
+                        format_func=lambda x: f"{x[1]} (ID:{x[0]})",
+                        key="shutdown_source_select",
+                    )
+                    if st.button("➕ 添加热源停机故障", use_container_width=True):
+                        st.session_state.fault_list.append(
+                            FaultConfig(fault_type=FAULT_TYPE_SOURCE_SHUTDOWN, target_id=selected_source[0])
+                        )
+                        st.rerun()
+                else:
+                    st.warning("所有热源均已设置为停机")
+
+            st.divider()
+            col_run1, col_run2 = st.columns(2)
+            with col_run1:
+                run_fault = st.button(
+                    "🔄 运行故障模拟计算",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=len(st.session_state.fault_list) == 0,
+                )
+            with col_run2:
+                if st.button("🔙 重置故障模拟", use_container_width=True):
+                    st.session_state.fault_results = None
+                    st.session_state.fault_impact = None
+                    st.session_state.fault_modified_network = None
+                    st.session_state.emergency_plan = None
+                    st.rerun()
+
+            if run_fault:
+                with st.spinner("🔬 正在进行故障工况水力热力耦合计算..."):
+                    try:
+                        fault_res, impact, modified_net = simulate_faults(
+                            net, normal_results,
+                            st.session_state.fault_list,
+                            st.session_state.source_temps,
+                        )
+                        st.session_state.fault_results = fault_res
+                        st.session_state.fault_impact = impact
+                        st.session_state.fault_modified_network = modified_net
+
+                        with st.spinner("📋 正在生成应急预案..."):
+                            plan, _, _ = generate_emergency_plan(
+                                net, modified_net, normal_results,
+                                fault_res, st.session_state.fault_list,
+                                impact, st.session_state.source_temps,
+                                min_temp_threshold=st.session_state.temp_threshold,
+                            )
+                            st.session_state.emergency_plan = plan
+
+                        st.success("✅ 故障模拟与应急预案生成完成！")
+                    except Exception as e:
+                        st.error(f"❌ 故障模拟失败：{e}")
+                        import traceback
+                        with st.expander("错误详情"):
+                            st.code(traceback.format_exc())
+
+        with col_right:
+            if st.session_state.fault_impact is None:
+                st.info("👈 请先在左侧添加故障并运行模拟计算")
+            else:
+                impact: ImpactAssessment = st.session_state.fault_impact
+                fault_results = st.session_state.fault_results
+                plan: EmergencyPlan = st.session_state.emergency_plan
+
+                st.markdown("##### 📊 故障影响评估汇总")
+                m1, m2, m3, m4 = st.columns(4)
+                total_users = len(net.get_nodes_by_type(NODE_TYPE_END_USER))
+                with m1:
+                    st.metric(
+                        "受影响用户",
+                        f"{len(impact.affected_user_ids)}/{total_users}",
+                        delta=f"{len(impact.affected_user_ids)/max(total_users,1)*100:.0f}%"
+                    )
+                with m2:
+                    st.metric(
+                        "断供用户",
+                        f"{len(impact.disconnected_user_ids)}",
+                        delta_color="inverse"
+                    )
+                with m3:
+                    st.metric(
+                        "压力不达标",
+                        f"{len(impact.low_pressure_users)}",
+                        delta=f"<{MIN_OPERATING_PRESSURE}mH₂O",
+                        delta_color="off"
+                    )
+                with m4:
+                    st.metric(
+                        "供热能力下降",
+                        f"{impact.total_heat_capacity_drop_pct:.1f}%",
+                        delta_color="inverse"
+                    )
+
+                st.divider()
+                tab_compare, tab_topo, tab_plan = st.tabs([
+                    "📋 正常vs故障对比", "🗺️ 故障拓扑图", "🚒 应急预案"
+                ])
+
+                with tab_compare:
+                    st.markdown("###### 各末端用户温度与压力对比")
+                    end_users = net.get_nodes_by_type(NODE_TYPE_END_USER)
+                    compare_rows = []
+                    for user in end_users:
+                        nr_normal = normal_results.node_results.get(user.id)
+                        nr_fault = fault_results.node_results.get(user.id) if fault_results else None
+                        is_disconnected = user.id in impact.disconnected_user_ids
+                        is_low_p = user.id in impact.low_pressure_users
+                        is_affected = user.id in impact.affected_user_ids
+
+                        temp_normal = nr_normal.temperature if nr_normal else 0.0
+                        press_normal = nr_normal.pressure if nr_normal else 0.0
+
+                        if is_disconnected:
+                            temp_fault = 0.0
+                            press_fault = 0.0
+                            temp_delta = -999.0
+                            press_delta = -999.0
+                            status = "❌ 断供"
+                        elif nr_fault:
+                            temp_fault = nr_fault.temperature
+                            press_fault = nr_fault.pressure
+                            temp_delta = temp_fault - temp_normal
+                            press_delta = press_fault - press_normal
+                            if is_low_p:
+                                status = "⚠️ 压力不足"
+                            elif is_affected:
+                                status = "🔶 受影响"
+                            else:
+                                status = "✅ 正常"
+                        else:
+                            temp_fault = 0.0
+                            press_fault = 0.0
+                            temp_delta = 0.0
+                            press_delta = 0.0
+                            status = "❓ 未知"
+
+                        compare_rows.append({
+                            "用户编号": user.id,
+                            "用户名称": user.name,
+                            "正常温度(°C)": f"{temp_normal:.1f}",
+                            "故障温度(°C)": f"{temp_fault:.1f}" if not is_disconnected else "断供",
+                            "温度变化(°C)": f"{temp_delta:+.1f}" if not is_disconnected else "--",
+                            "正常压力(mH₂O)": f"{press_normal:.2f}",
+                            "故障压力(mH₂O)": f"{press_fault:.2f}" if not is_disconnected else "断供",
+                            "压力变化(mH₂O)": f"{press_delta:+.2f}" if not is_disconnected else "--",
+                            "状态": status,
+                            "_is_bad": is_disconnected or is_low_p or (abs(temp_delta) > 3 if not is_disconnected else False),
+                        })
+
+                    def apply_compare_style(x):
+                        styles = pd.DataFrame("", index=x.index, columns=df_compare_display.columns)
+                        for idx, rdata in enumerate(compare_rows):
+                            if rdata["_is_bad"]:
+                                if rdata["状态"] == "❌ 断供":
+                                    bg_color = "#ffcccc"
+                                    text_color = "#cc0000"
+                                elif rdata["状态"] == "⚠️ 压力不足":
+                                    bg_color = "#ffe0cc"
+                                    text_color = "#cc5500"
+                                else:
+                                    bg_color = "#fff4cc"
+                                    text_color = "#996600"
+                                styles.loc[idx, :] = f"background-color: {bg_color}; color: {text_color}; font-weight: bold"
+                        return styles
+
+                    df_compare_display = pd.DataFrame([{
+                        k: v for k, v in r.items() if not k.startswith("_")
+                    } for r in compare_rows])
+                    styled_compare = df_compare_display.style.apply(apply_compare_style, axis=None)
+                    st.dataframe(
+                        styled_compare,
+                        use_container_width=True, hide_index=True, height=420,
+                    )
+                    st.caption("🔴 红色=断供 | 🟠 橙色=压力不足 | 🟡 黄色=温度/压力显著变化")
+
+                    st.divider()
+                    st.markdown("###### 📈 关键指标对比")
+                    metric_compare = [
+                        ["总供热量 (MW)",
+                         f"{impact.original_total_heat/1e6:.2f}",
+                         f"{impact.fault_total_heat/1e6:.2f}" if fault_results else "计算失败",
+                         f"{-impact.total_heat_capacity_drop_pct:.1f}%"],
+                        ["最大管段压降变化 (kPa)",
+                         "--",
+                         f"{impact.max_pressure_drop_change/1000:.2f}" if fault_results else "--",
+                         f"{impact.max_pressure_drop_change/1000:+.2f}"],
+                        ["受影响用户数", "0",
+                         f"{len(impact.affected_user_ids)}",
+                         f"+{len(impact.affected_user_ids)}"],
+                        ["断供用户数", "0",
+                         f"{len(impact.disconnected_user_ids)}",
+                         f"+{len(impact.disconnected_user_ids)}"],
+                        ["压力低于20mH₂O用户数",
+                         f"{sum(1 for u in end_users if (normal_results.node_results.get(u.id) and normal_results.node_results[u.id].pressure < MIN_OPERATING_PRESSURE))}",
+                         f"{len(impact.low_pressure_users)}",
+                         f"+{max(0, len(impact.low_pressure_users) - sum(1 for u in end_users if (normal_results.node_results.get(u.id) and normal_results.node_results[u.id].pressure < MIN_OPERATING_PRESSURE)))}"],
+                    ]
+                    df_metric = pd.DataFrame(metric_compare, columns=["指标", "正常工况", "故障工况", "变化"])
+                    st.dataframe(df_metric, use_container_width=True, hide_index=True)
+
+                with tab_topo:
+                    if st.session_state.fault_modified_network is not None:
+                        with st.spinner("绘制故障拓扑图..."):
+                            fig_fault = create_fault_topology_figure(
+                                net, fault_results,
+                                impact, st.session_state.fault_list,
+                                normal_results,
+                            )
+                            st.plotly_chart(fig_fault, use_container_width=True)
+                    else:
+                        st.info("故障拓扑图暂不可用")
+
+                with tab_plan:
+                    if plan and plan.actions:
+                        st.markdown(f"###### 🚒 {plan.summary}")
+
+                        if plan.warnings:
+                            for w in plan.warnings:
+                                st.warning(f"⚠️ {w}")
+
+                        sorted_actions = plan.sorted_actions()
+                        priority_labels = {1: "🔴 紧急", 2: "🟠 高", 3: "🟡 中", 4: "🔵 低"}
+                        for action in sorted_actions:
+                            p_label = priority_labels.get(action.priority, f"优先级{action.priority}")
+                            with st.expander(f"{p_label} | {action.description}", expanded=(action.priority <= 2)):
+                                st.markdown(f"**措施类型**: {action.action_type}")
+                                st.markdown(f"**实施对象**: {action.target_name} (ID:{action.target_id})")
+                                if action.detail:
+                                    st.markdown(f"**详细说明**: {action.detail}")
+                                if action.estimated_effect:
+                                    st.success(f"💡 预期效果: {action.estimated_effect}")
+
+                        st.divider()
+                        st.markdown("""
+                        > 📌 **调度操作注意事项**：
+                        > 1. 优先执行优先级1、2的紧急措施；
+                        > 2. 阀门操作应缓慢进行，避免管网水击；
+                        > 3. 热源调整应逐步提升温度，每次不超过5°C；
+                        > 4. 每项措施实施后应等待15-30分钟观察管网变化；
+                        > 5. 建议实施应急措施后重新运行计算进行效果验证。
+                        """)
+                    else:
+                        st.info("暂无应急预案内容")
+
+with tabs[8]:
     st.subheader("📝 管网数据编辑")
     net = st.session_state.network
     if net is None:
@@ -1102,7 +1456,7 @@ with tabs[7]:
                 t = st.slider(f"{sn.name} 供水温度 (°C)", 60.0, 150.0, float(default_t), 1.0, key=f"src_t_{sn.id}")
                 st.session_state.source_temps[sn.id] = t
 
-with tabs[8]:
+with tabs[9]:
     st.subheader("📄 供热运行分析报告导出")
     if st.session_state.results is None:
         st.info("请先运行计算后再导出报告")
